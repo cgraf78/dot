@@ -2142,6 +2142,42 @@ def read_proc_file(path: str) -> bytes:
         os.close(descriptor)
 
 
+def read_proc_process(
+    root: str, pid: int
+) -> SessionProcess | None:
+    """Read and parse one procfs stat row, tolerating a torn read.
+
+    Returns the row, or None when the row cannot be parsed. Raises
+    FileNotFoundError when the entry vanished while being read: the
+    process was reaped mid-read and the row is safe to skip, because a
+    dead process cannot come back and a later snapshot re-attributes
+    any process that reuses the ID. Raises OSError when the row is live
+    but unreadable, so a partial snapshot never silently omits a live
+    member. A torn read is not exotic: a process can exit between
+    opening its stat file and reading it, and the read then returns an
+    empty or truncated row; failing the whole walk for that one row
+    drops the snapshot to the `ps` fallback, whose members carry no
+    start identity and can never be pinned.
+    """
+    path = f"{root}/{pid}/stat"
+    try:
+        stat = read_proc_file(path)
+    except PermissionError:
+        raise
+    except FileNotFoundError:
+        raise
+    except OSError:
+        # The row may have vanished mid-read; re-read once to tell a
+        # reaped process from a live but unreadable member.
+        stat = read_proc_file(path)
+    process = parse_proc_process(pid, stat)
+    if process is not None:
+        return process
+    # Same race, surfaced as an empty or truncated row.
+    stat = read_proc_file(path)
+    return parse_proc_process(pid, stat)
+
+
 def list_proc_session_processes(
     session_id: int,
     proc_root: str | os.PathLike[str] = "/proc",
@@ -2164,7 +2200,11 @@ def list_proc_session_processes(
         if not name.isdecimal():
             continue
         try:
-            stat = read_proc_file(f"{root}/{name}/stat")
+            pid = int(name)
+        except ValueError:
+            return None
+        try:
+            process = read_proc_process(root, pid)
         except FileNotFoundError:
             # Processes can disappear during collection.
             continue
@@ -2174,12 +2214,6 @@ def list_proc_session_processes(
             # A partial snapshot is not authoritative. Let the caller use its
             # platform fallback instead of silently omitting a live member.
             return None
-
-        try:
-            pid = int(name)
-        except ValueError:
-            return None
-        process = parse_proc_process(pid, stat)
         if process is None:
             return None
         processes.append(process)
@@ -2660,7 +2694,18 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             if process_info.pid == process.pid:
                 continue
             previous = known_members.get(process_info.pid)
-            if previous is not None and not same_process_identity(
+            if previous is not None and process_info.start is None:
+                # A start-less row cannot prove a different process: the
+                # `ps` fallback carries no start identity. Keep the
+                # pinned handle (the pidfd is the authority, and it can
+                # only ever signal the exact task it was opened for) and
+                # refresh the row's other fields, so a transient fallback
+                # neither drops the pin nor freezes the member's liveness
+                # and delegation while its nearer owner dies.
+                previous.process = process_info._replace(
+                    start=previous.process.start
+                )
+            elif previous is not None and not same_process_identity(
                 previous.process, process_info
             ):
                 previous.close()
@@ -2721,6 +2766,33 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             process_info.pid == process.pid
             or not process_info.live
             or process_info.delegated
+            or (
+                process_info.pid in known_members
+                and same_process_identity(
+                    known_members[process_info.pid].process, process_info
+                )
+            )
+            for process_info in processes
+        )
+
+    def cohort_unprobed(processes: list[SessionProcess] | None) -> bool:
+        """Whether every live member is exact or carries no start identity.
+
+        A `ps`-fallback snapshot has no start time, so its members can
+        never be pinned; that alone must not end overtime where exact
+        authority exists, because the member may already be dying from
+        the group signal or its nearer owner and the next snapshot will
+        show it gone. A live member WITH a start identity that is
+        neither delegated nor pinned still ends overtime: it can only
+        exit on its own. Only consulted where pidfds exist; without
+        exact authority a start-less member is the norm, not a fallback
+        artifact, so the gate stays strict there.
+        """
+        return processes is not None and all(
+            process_info.pid == process.pid
+            or not process_info.live
+            or process_info.delegated
+            or process_info.start is None
             or (
                 process_info.pid in known_members
                 and same_process_identity(
@@ -2842,7 +2914,11 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             # sticky fail-closed state (ambiguity, broken nested control)
             # or a live member this owner cannot signal exactly (it could
             # only exit on its own, and waiting for that would change the
-            # fail-closed outcome). The delegated-owner wait already has
+            # fail-closed outcome). A member with no start identity is
+            # different: the `ps` fallback cannot pin it, so its
+            # inexactness proves nothing about whether it can be
+            # stopped, and the group signal or its nearer owner may
+            # already be stopping it. The delegated-owner wait already has
             # its own grace and never KILLs the leader, so it gets no
             # overtime either.
             if overtime and not (
@@ -2850,7 +2926,13 @@ def stop_process_group(first_signal: int) -> CleanupResult:
                 and not wait_for_owner
                 and complete_observations < KILL_PHASE_MIN_OBSERVATIONS
                 and not unsafe_direct_member
-                and exact_cohort(last_complete)
+                and (
+                    exact_cohort(last_complete)
+                    or (
+                        not exact_signals_unavailable
+                        and cohort_unprobed(last_complete)
+                    )
+                )
             ):
                 break
             # Past the deadline each snapshot gets its own bounded budget;
