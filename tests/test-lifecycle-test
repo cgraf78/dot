@@ -1690,6 +1690,19 @@ if mode == "stuck":
     # so an exact cohort can never certify.
     module.nested_ever_registered = True
     module.lease_closed = lambda: False
+if mode == "fallback":
+    # A transient procfs failure drops the snapshot to the `ps` fallback
+    # mid-KILL: members lose their start identity, so they can never be
+    # pinned from the fallback, but the retained pidfds still stop the
+    # reparented target. Fails the walk for the early KILL loop only.
+    real_walk = module.list_proc_session_processes
+    walk_calls = [0]
+    def fallback_walk(*args, **kwargs):
+        walk_calls[0] += 1
+        if 4 <= walk_calls[0] <= 9:
+            return None
+        return real_walk(*args, **kwargs)
+    module.list_proc_session_processes = fallback_walk
 # The target ignores TERM before writing its ready marker, so a ready marker
 # proves cleanup really reached the KILL phase. In "unpinned" mode it also
 # leaves a TERM-ignoring member in its own process group, beyond the group
@@ -1709,7 +1722,7 @@ program = (
 )
 member_file = Path(ready + ".member")
 target = [sys.executable, "-c", program, ready, str(member_file), mode]
-if mode == "nested":
+if mode in ("nested", "fallback"):
     # The test cancels this outer owner once the target is ready. The real
     # inner wrapper registers as its nested owner, is murdered by the outer
     # KILL, and its link then needs strikes before the outer can certify.
@@ -1743,7 +1756,7 @@ def run(mode):
             stderr=subprocess.PIPE,
             pass_fds=session_fds(),
         )
-        if mode == "nested":
+        if mode in ("nested", "fallback"):
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline and child.poll() is None:
                 try:
@@ -1787,6 +1800,18 @@ assert fields.get("status") == "143", (
     "slow snapshots turned a verified nested cancellation into incomplete cleanup",
     report,
 )
+
+# A transient procfs failure mid-KILL must not lose the cleanup: the `ps`
+# fallback carries no start identity, so the reparented target is stopped
+# through its retained pidfd and the KILL phase keeps observing. The
+# snapshot bound pins that: without the retained pin the target is only
+# re-pinned once the walk recovers, and the run takes the full minimum.
+fields, report = run("fallback")
+assert fields.get("status") == "143", (
+    "a transient procfs fallback turned a verified nested cancellation into incomplete cleanup",
+    report,
+)
+assert snapshots(fields) <= 11, ("fallback KILL phase ran over", report)
 
 # Sticky fail-closed state cannot certify, so the KILL phase ends at its
 # deadline: at most two snapshots per phase.
@@ -2341,6 +2366,25 @@ with tempfile.TemporaryDirectory() as temporary:
         assert module.list_proc_session_processes(123, proc_root) is None
     finally:
         module.os.listdir = real_listdir
+    # A process reaped between opening its stat file and reading it
+    # leaves a torn row; the re-read finds the entry gone, so the row
+    # is skipped instead of failing the whole walk.
+    real_read_proc_file = module.read_proc_file
+    torn_calls = []
+
+    def torn_then_gone(path, *args, **kwargs):
+        if str(path).endswith("/124/stat") and not torn_calls:
+            torn_calls.append(path)
+            return b""
+        if str(path).endswith("/124/stat"):
+            raise FileNotFoundError(errno.ENOENT, "reaped mid-read", path)
+        return real_read_proc_file(path, *args, **kwargs)
+
+    module.read_proc_file = torn_then_gone
+    try:
+        assert module.list_proc_session_pids(123, proc_root) == [123]
+    finally:
+        module.read_proc_file = real_read_proc_file
     # A row longer than one read chunk is still read whole.
     long_row = proc_root / "long"
     long_row.write_bytes(b"x" * 10000)
