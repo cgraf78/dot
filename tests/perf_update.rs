@@ -3340,7 +3340,7 @@ fn base_only_remotes(tools: &PerfTools, scratch: &Scratch) -> Remotes {
 
 fn feature_remotes(tools: &PerfTools, scratch: &Scratch) -> Remotes {
     let mut remotes = shared_remotes(tools, scratch, "features");
-    for index in 0..OVERLAYS {
+    for (index, overlay) in remotes.overlays.iter().enumerate().take(OVERLAYS) {
         let seed = scratch
             .path()
             .join(format!("features-overlay-{index}-seed"));
@@ -3355,12 +3355,7 @@ fn feature_remotes(tools: &PerfTools, scratch: &Scratch) -> Remotes {
         git(
             tools,
             &seed,
-            &[
-                "push",
-                "-q",
-                &remotes.overlays[index].to_string_lossy(),
-                "HEAD:main",
-            ],
+            &["push", "-q", &overlay.to_string_lossy(), "HEAD:main"],
         );
     }
     remotes.overlays.push(seed_remote(

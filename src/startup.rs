@@ -126,27 +126,83 @@ fn cargo_source_root_from(
     // Cargo may place target artifacts outside the checkout. `OUT_DIR` and
     // `CARGO_MANIFEST_DIR` are compile-time values, so unlike process
     // environment they cannot redirect a built binary. Restrict the fallback
-    // to a direct binary or `deps/` artifact in the exact Cargo profile that
+    // to a direct binary, a `deps/` artifact, or a test executable in the
+    // build script output directory, all in the exact Cargo profile that
     // produced this crate; a copied or installed binary must carry release
     // metadata beside itself.
-    let profile = out_dir.ancestors().nth(3)?;
-    let profile = std::fs::canonicalize(profile).ok()?;
-    let relative = executable.strip_prefix(&profile).ok()?;
-    let mut components = relative.components();
-    let cargo_artifact = match (components.next(), components.next(), components.next()) {
-        (Some(std::path::Component::Normal(_)), None, None) => true,
-        (
-            Some(std::path::Component::Normal(directory)),
-            Some(std::path::Component::Normal(_)),
-            None,
-        ) => directory == OsStr::new("deps"),
-        _ => false,
-    };
-    if !cargo_artifact {
-        return None;
+    //
+    // Cargo 1.100 split the build script output directory into
+    // `build/<crate>/<hash>/out` (previously `build/<crate>-<hash>/out`)
+    // and emits test executables into that directory instead of `deps/`,
+    // so the profile directory is four ancestors above `OUT_DIR` there
+    // and three on older Cargo. Both depths are tried, but each candidate
+    // is anchored to `OUT_DIR`'s lexical shape first: without this, a
+    // stray binary directly under `<profile>/build/` would match the
+    // direct-binary arm against the wrong-depth candidate. The
+    // manifest-shape check below is what anchors the answer to this
+    // crate, so a candidate that passes both checks can only resolve
+    // this crate's own checkout, never a foreign tree.
+    for depth in [3, 4] {
+        let Some(profile) = out_dir.ancestors().nth(depth) else {
+            continue;
+        };
+        let Ok(suffix) = out_dir.strip_prefix(profile) else {
+            continue;
+        };
+        let suffix: Vec<std::path::Component<'_>> = suffix.components().collect();
+        let layout = suffix.len() == depth
+            && matches!(suffix.first(), Some(std::path::Component::Normal(name)) if *name == OsStr::new("build"))
+            && matches!(suffix.last(), Some(std::path::Component::Normal(name)) if *name == OsStr::new("out"));
+        if !layout {
+            continue;
+        }
+        let Ok(profile) = std::fs::canonicalize(profile) else {
+            continue;
+        };
+        let Ok(relative) = executable.strip_prefix(&profile) else {
+            continue;
+        };
+        let mut components = relative.components();
+        let cargo_artifact = match (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ) {
+            // A direct binary in the profile directory.
+            (Some(std::path::Component::Normal(_)), None, None, None, None, None) => true,
+            // A `deps/` artifact.
+            (
+                Some(std::path::Component::Normal(directory)),
+                Some(std::path::Component::Normal(_)),
+                None,
+                None,
+                None,
+                None,
+            ) => directory == OsStr::new("deps"),
+            // A test executable Cargo 1.100+ emits into the build script
+            // output directory: `build/<crate>/<hash>/out/<binary>`.
+            (
+                Some(std::path::Component::Normal(build)),
+                Some(std::path::Component::Normal(_)),
+                Some(std::path::Component::Normal(_)),
+                Some(std::path::Component::Normal(out)),
+                Some(std::path::Component::Normal(_)),
+                None,
+            ) => build == OsStr::new("build") && out == OsStr::new("out"),
+            _ => false,
+        };
+        if !cargo_artifact {
+            continue;
+        }
+        let manifest = std::fs::canonicalize(manifest_dir).ok()?;
+        if source_root_shape(&manifest, require_public) {
+            return Some(manifest);
+        }
     }
-    let manifest = std::fs::canonicalize(manifest_dir).ok()?;
-    source_root_shape(&manifest, require_public).then_some(manifest)
+    None
 }
 
 fn source_root_error() -> std::io::Error {
@@ -909,6 +965,64 @@ mod tests {
         assert_eq!(
             cargo_source_root_from(&copied, &out_dir, &manifest, true),
             None
+        );
+    }
+
+    #[test]
+    fn cargo_source_root_accepts_cargo_1_100_test_executable_layout() {
+        // Cargo 1.100 split the build script output directory into
+        // `build/<crate>/<hash>/out` and emits test executables there
+        // instead of `deps/`. The profile directory is then four
+        // ancestors above `OUT_DIR`, and the executable's relative path
+        // is `build/<crate>/<hash>/out/<binary>`.
+        let scratch = TempDir::new("cargo-source-root-1-100").expect("scratch");
+        let manifest = scratch.path().join("checkout");
+        let profile = scratch.path().join("external-target/debug");
+        let out_dir = profile.join("build/dot-fixture/1622147bfc5bbc81/out");
+        let executable = profile.join("build/dot-fixture/1622147bfc5bbc81/out/dot-fixture");
+        let release = profile.join("dot-fixture");
+        let foreign = scratch
+            .path()
+            .join("external-target/release/build/dot-fixture/1622147bfc5bbc81/out/dot-fixture");
+        std::fs::create_dir_all(manifest.join("lib/dot/public")).expect("public API");
+        std::fs::write(manifest.join("Cargo.toml"), b"[package]\n").expect("manifest");
+        std::fs::create_dir_all(&out_dir).expect("Cargo OUT_DIR");
+        std::fs::write(&executable, b"binary").expect("test executable");
+        std::fs::write(&release, b"binary").expect("release executable");
+        std::fs::create_dir_all(foreign.parent().expect("foreign parent"))
+            .expect("foreign profile");
+        std::fs::write(&foreign, b"binary").expect("foreign executable");
+
+        let executable = executable.canonicalize().expect("canonical executable");
+        assert_eq!(
+            cargo_source_root_from(&executable, &out_dir, &manifest, true),
+            Some(manifest.canonicalize().expect("canonical manifest")),
+            "Cargo 1.100 test executable must resolve its compiled profile"
+        );
+        let release = release.canonicalize().expect("canonical release");
+        assert_eq!(
+            cargo_source_root_from(&release, &out_dir, &manifest, true),
+            Some(manifest.canonicalize().expect("canonical manifest")),
+            "release binary in the same profile must still resolve"
+        );
+        let foreign = foreign.canonicalize().expect("canonical foreign");
+        assert_eq!(
+            cargo_source_root_from(&foreign, &out_dir, &manifest, true),
+            None,
+            "an executable from another profile must not resolve"
+        );
+        // A stray binary directly under `<profile>/build/` must not
+        // resolve against the wrong-depth candidate: the depth-3
+        // candidate is `<profile>/build` itself, so without the
+        // `OUT_DIR` layout anchor its single-component relative path
+        // would match the direct-binary arm.
+        let stray = profile.join("build/stray");
+        std::fs::write(&stray, b"binary").expect("stray executable");
+        let stray = stray.canonicalize().expect("canonical stray");
+        assert_eq!(
+            cargo_source_root_from(&stray, &out_dir, &manifest, true),
+            None,
+            "a stray binary under the build directory must not resolve"
         );
     }
 

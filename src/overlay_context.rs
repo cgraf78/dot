@@ -273,10 +273,7 @@ pub fn absolute_canonical(path: &[u8]) -> bool {
             return false;
         }
     }
-    if path.ends_with(b"/.") || path.ends_with(b"/..") {
-        return false;
-    }
-    true
+    !(path.ends_with(b"/.") || path.ends_with(b"/.."))
 }
 
 /// `_dot_overlay_record_validate`: exactly six `|`-separated
