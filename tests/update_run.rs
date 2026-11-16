@@ -1953,7 +1953,8 @@ fn failed_pre_sync_keeps_the_repos_counts_the_shell_engine_printed() {
     // Only an overlay descriptor fault replaces the Repos counts: every other
     // convergence failure keeps the row the shell engine printed, which the
     // release performance gate compares byte for byte (its pre-sync-failure
-    // workload is exactly this client).
+    // workload is exactly this client; it drops only the native failure-note
+    // line, which the shell engine's older hook runtime never printed).
     let scratch = Scratch::new("update-run-pre-sync-row").expect("scratch dir");
     let (home, state) = waiting_hook_client(&scratch, "pre-sync-row");
     std::fs::write(

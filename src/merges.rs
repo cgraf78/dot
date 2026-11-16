@@ -648,8 +648,48 @@ struct ResultRecord {
     hook: Hook,
     rc: i32,
     output: Vec<u8>,
+    /// The worker's failure note as one detail line (`exited with status N
+    /// at <file>:<line>: <command>`), for a failed hook that left one.
+    note: Option<Vec<u8>>,
     has_merge: bool,
     elapsed_ms: i64,
+}
+
+impl ResultRecord {
+    /// The capture as rendered: the hook's own output, then the note line, so
+    /// even a hook that failed silently (a bare `|| return 1`) names the line
+    /// that stopped it.
+    fn shown_output(&self) -> std::borrow::Cow<'_, [u8]> {
+        let Some(note) = &self.note else {
+            return std::borrow::Cow::Borrowed(&self.output);
+        };
+        let mut shown = self.output.clone();
+        if !shown.is_empty() && !shown.ends_with(b"\n") {
+            shown.push(b'\n');
+        }
+        shown.extend_from_slice(note);
+        shown.push(b'\n');
+        std::borrow::Cow::Owned(shown)
+    }
+
+    /// The recorded failure detail. A hook's own last line usually names the
+    /// cause (hooks warn just before they fail), so it wins; the note stands
+    /// in for a hook that printed nothing but its opening title (`Git`),
+    /// which names the hook rather than the cause.
+    fn failure_detail(&self) -> String {
+        let own = crate::update_status::last_line(&self.output);
+        let Some(note) = &self.note else {
+            return own;
+        };
+        let (first, rest) = result_label_bytes(&self.hook.key, &self.output);
+        let title_only =
+            rest.is_empty() && names_hook(&first, label_from_script(&self.hook.key).as_bytes());
+        if own.is_empty() || title_only {
+            crate::update_status::last_line(note)
+        } else {
+            own
+        }
+    }
 }
 
 /// State shared by every batch in one Configs stage. Keeping scheduling state
@@ -679,6 +719,7 @@ fn run_one(
             hook,
             rc: 1,
             output: b"dot: cannot create private merge-hook TMPDIR\n".to_vec(),
+            note: None,
             has_merge: false,
             elapsed_ms: 0,
         };
@@ -718,11 +759,19 @@ fn run_one(
     let has_merge = std::fs::read_to_string(&result)
         .ok()
         .is_some_and(|value| value.trim() == "1");
+    // A note whose status differs from the exit status is about some other
+    // failure the hook survived, so it would blame the wrong line.
+    let note = (rc != 0)
+        .then(|| crate::doctor_orchestrator::FailureNote::read(&result))
+        .flatten()
+        .filter(|note| note.status == rc)
+        .map(|note| note.detail());
     let _ = std::fs::remove_dir_all(&temporary);
     ResultRecord {
         hook,
         rc,
         output,
+        note,
         has_merge,
         elapsed_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
     }
@@ -761,6 +810,7 @@ fn wait_for_worker(
                     hook,
                     rc: 1,
                     output: Vec::new(),
+                    note: None,
                     has_merge: false,
                     elapsed_ms: 0,
                 };
@@ -871,20 +921,21 @@ fn replay(
             failed += 1;
             failures.push((
                 record.hook.key.to_string_lossy().into_owned(),
-                crate::update_status::last_line(&record.output),
+                record.failure_detail(),
             ));
         }
         if !record.has_merge {
             continue;
         }
         merged += 1;
+        let shown = record.shown_output();
         if inputs.verbose && !inputs.quiet {
             // The row names the hook; everything the hook printed follows as
             // its detail lines. A first line was the row title before, so a
             // hook that opened with a diagnostic left the row unnamed. A
             // first line that is the hook's own title still names the row,
             // so it is not repeated below it.
-            let (first, rest) = result_label_bytes(&record.hook.key, &record.output);
+            let (first, rest) = result_label_bytes(&record.hook.key, &shown);
             let key = label_from_script(&record.hook.key).as_bytes().to_vec();
             let (name, title) = if names_hook(&first, &key) {
                 (first, None)
@@ -912,12 +963,12 @@ fn replay(
             } else {
                 "failed"
             };
-            if !record.output.is_empty() {
+            if !shown.is_empty() {
                 inputs.log.warn(
                     err,
                     &format!("  {} output:", record.hook.key.to_string_lossy()),
                 );
-                for line in record.output.split_inclusive(|byte| *byte == b'\n') {
+                for line in shown.split_inclusive(|byte| *byte == b'\n') {
                     let _ = err.write_all(b"    ");
                     let _ = err.write_all(line);
                 }
@@ -1245,6 +1296,7 @@ mod tests {
             },
             rc: 0,
             output: output.to_vec(),
+            note: None,
             has_merge: true,
             elapsed_ms: 7,
         };
@@ -1268,6 +1320,119 @@ mod tests {
              \x20   kept 3 jobs\n\
              \x20 ok       git                          7ms\n\
              \x20   merged\n"
+        );
+    }
+
+    #[test]
+    fn failure_note_renders_under_the_hook_and_fills_silent_details() {
+        // A silent failure (a bare `|| return 1`) shows only the note, which
+        // also becomes its recorded detail; a hook that warned before failing
+        // keeps its own warning as the detail, with the note rendered after;
+        // a hook that printed only its title records the note too.
+        let scope = TempDir::new("merge-failure-note").expect("fixture");
+        let env = BTreeMap::from([
+            (OsString::from("HOME"), scope.path().as_os_str().to_owned()),
+            (
+                OsString::from("DOT_SOURCE_ROOT"),
+                OsString::from(env!("CARGO_MANIFEST_DIR")),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, scope.path()).expect("runtime");
+        let palette = crate::progress_ui::Palette::empty();
+        let log = crate::log::Log::new(false, false);
+        let inputs = RunInputs {
+            runtime: &runtime,
+            update_lock_token: None,
+            extension_inputs: crate::extension_trust::Inputs {
+                euid: 0,
+                home: String::new(),
+                extensions_dir: String::new(),
+                manifest: String::new(),
+            },
+            extensions_enabled: true,
+            overlays: &[],
+            tmp: scope.path(),
+            update_jobs: None,
+            merge_jobs: None,
+            verbose: false,
+            quiet: false,
+            force: false,
+            palette: &palette,
+            multibyte: false,
+            ascii: true,
+            ui_total: Some("1"),
+            bar_width: "8",
+            log: &log,
+        };
+        let failed = |key: &str, output: &[u8], note: &[u8]| ResultRecord {
+            hook: Hook {
+                key: OsString::from(key),
+                script: std::path::PathBuf::from(format!("{key}.sh")),
+            },
+            rc: 1,
+            output: output.to_vec(),
+            note: Some(note.to_vec()),
+            has_merge: true,
+            elapsed_ms: 7,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut failures = Vec::new();
+        let counts = super::replay(
+            vec![
+                failed(
+                    "10-quiet",
+                    b"",
+                    b"exited with status 1 at merge-hooks.d/10-quiet.sh:4: return 1",
+                ),
+                failed(
+                    "20-loud",
+                    b"warning: cannot parse settings",
+                    b"exited with status 1 at merge-hooks.d/20-loud.sh:9: return 1",
+                ),
+                failed(
+                    "30-sapling",
+                    b"Sapling\n",
+                    b"exited with status 1 at merge-hooks.d/30-sapling.sh:5: return 1",
+                ),
+            ],
+            &inputs,
+            &mut out,
+            &mut err,
+            &mut failures,
+        );
+        assert_eq!(counts, (3, 3));
+        assert!(out.is_empty());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "  10-quiet output:\n\
+             \x20   exited with status 1 at merge-hooks.d/10-quiet.sh:4: return 1\n\
+             \x20 warning: merge failed\n\
+             \x20 20-loud output:\n\
+             \x20   warning: cannot parse settings\n\
+             \x20   exited with status 1 at merge-hooks.d/20-loud.sh:9: return 1\n\
+             \x20 warning: merge failed\n\
+             \x20 30-sapling output:\n\
+             \x20   Sapling\n\
+             \x20   exited with status 1 at merge-hooks.d/30-sapling.sh:5: return 1\n\
+             \x20 warning: merge failed\n"
+        );
+        assert_eq!(
+            failures,
+            vec![
+                (
+                    "10-quiet".to_string(),
+                    "exited with status 1 at merge-hooks.d/10-quiet.sh:4: return 1".to_string()
+                ),
+                (
+                    "20-loud".to_string(),
+                    "warning: cannot parse settings".to_string()
+                ),
+                (
+                    "30-sapling".to_string(),
+                    "exited with status 1 at merge-hooks.d/30-sapling.sh:5: return 1".to_string()
+                ),
+            ]
         );
     }
 
@@ -1390,6 +1555,7 @@ mod tests {
             },
             rc: 0,
             output: output.to_vec(),
+            note: None,
             has_merge: true,
             elapsed_ms: 7,
         };
@@ -1532,6 +1698,7 @@ mod tests {
                     },
                     rc: 0,
                     output: b"done".to_vec(),
+                    note: None,
                     has_merge: true,
                     elapsed_ms: 7,
                 });

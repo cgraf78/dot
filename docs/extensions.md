@@ -25,11 +25,12 @@ invocation; obsolete `bash-v1` bootstrap hints are not consulted. `dot doctor`
 uses the same cached probe when checking configured shell-hook or Shdeps
 capabilities. Workers use `--noprofile` and `--norc`, start in `$HOME`, close
 stdin, set `umask 077`, enable
-`errexit`/`nounset`/`pipefail`, clear every resettable trap, and start with
-`extglob`, `nocasematch`, and `nullglob` disabled. POSIX shell semantics do not
-let a shell reset signals it inherited as ignored, so those exact host
-dispositions (notably GitHub runners' ignored `SIGPIPE`) can remain visible.
-Each worker receives a different private `TMPDIR`.
+`errexit`/`nounset`/`pipefail`, clear every resettable trap (merge, pre-sync,
+and doctor workers then arm their own failure-note traps, described below),
+and start with `extglob`, `nocasematch`, and `nullglob` disabled. POSIX shell
+semantics do not let a shell reset signals it inherited as ignored, so those
+exact host dispositions (notably GitHub runners' ignored `SIGPIPE`) can remain
+visible. Each worker receives a different private `TMPDIR`.
 
 Ordinary exported client variables remain available because configuration
 policy can legitimately depend on platform and tool context. Bash startup and
@@ -41,6 +42,29 @@ change its own functions, variables, options, or traps, but that state cannot
 reach the coordinator or another extension. Merge hooks define `merge()`;
 pre-sync extensions define `prepare()`; doctor extensions define `doctor()`.
 All entry points receive no arguments.
+
+Merge, pre-sync, and doctor workers run their extension with `errtrace`
+(`set -E`) and `ERR`, `RETURN`, and `EXIT` traps that note where a failure
+stopped it: the file, line, and command of a failing command under `set -e`,
+or of an explicit nonzero `return` in the entry point (so a silent guard such
+as `[[ -f $file ]] || return 1` in `prepare()` names its line). A failing
+`return` in a nested function, or a failure inside a public helper, is
+reported at the line in the entry point that called it. An entry point
+written on one line, or one that ends on a failing command after a nested
+failure, has no return line to name, so its note gives only the last command.
+A failed merge hook shows the note after its output, a failed pre-sync
+extension as a line under its warning, and a failed doctor extension in its
+row. A merge hook that printed nothing, or only its title, also records the
+note as its failure detail.
+
+Only the entry point carries the trace attribute (`declare -ft`), not every
+function (`set -T`), so a `trap ... RETURN` that a hook sets inside a helper
+fires only on returns from that helper and the entry point, never on returns
+from functions the helper calls. Two consequences of tracing the entry point:
+a `RETURN` or `DEBUG` trap the hook sets at file level also fires inside, or
+on return from, the entry point; and a `RETURN` trap the hook leaves armed
+replaces the worker's, as does replacing `ERR` or `EXIT`, which leaves later
+failures unlocated. Deactivation hooks run without these traps.
 
 A Git-backed overlay may also provide the repository-only entry point
 `dot/profile-deactivate`, defining `deactivate()`. Dot records only validated
@@ -272,11 +296,12 @@ an extension must work against both an older and a newer coordinator:
   extensions still run, including the first claimant of a duplicated
   identity. Older coordinators ran no extension at all in this case.
 - An extension that exits nonzero gets a `<name> doctor extension failed` row
-  with its exit status and, when a failing command under `set -e` stopped
-  it, the file, line, and command (for a public helper that rejected its
-  arguments, the line that called it and the helper's name). For a pipeline
-  that fails under `pipefail` in an element other than its last, Bash exposes
-  only the last element's command and line, so the row shows
+  with its exit status and, when a failing command under `set -e` or an
+  explicit nonzero `return` stopped it, the file, line, and command (for a
+  public helper that rejected its arguments, the line that called it and the
+  helper's name). For a pipeline that fails under `pipefail` in an element
+  other than its last, Bash exposes only the last element's command and
+  line, so the row shows
   `pipeline with statuses 1 0, ending in: <last command>` with each
   element's exit status. A file that fails while it is being sourced says so. The last lines of its captured
   output are listed below the row. Older coordinators showed only the

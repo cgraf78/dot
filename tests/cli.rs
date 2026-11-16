@@ -5424,6 +5424,10 @@ fn update_native_failed_merge_hook_reports_its_capture() {
     assert!(has_bytes(&output.stderr, b"10-config output:"));
     assert!(has_bytes(&output.stderr, b"merge stdout\n"));
     assert!(has_bytes(&output.stderr, b"merge stderr\n"));
+    assert!(has_bytes(
+        &output.stderr,
+        b"merge stderr\n    exited with status 7; last command: return 7\n"
+    ));
 }
 
 #[test]

@@ -2537,7 +2537,9 @@ fn failing_last_command_reports_the_command() {
 }
 
 #[test]
-fn explicit_return_reports_the_status_and_command() {
+fn explicit_return_reports_its_line() {
+    // The RETURN trap sees the `return` line itself, which ERR, firing only
+    // after the function unwound, cannot.
     let (_scope, home, state) = crash_fixture(
         "crash-return",
         "doctor() {\n  dot_doctor_ok 'ran'\n  return 4\n}\n",
@@ -2546,7 +2548,7 @@ fn explicit_return_reports_the_status_and_command() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "  ✗ 10-crash doctor extension failed\n    exited with status 4; last command: return 4\n"
+            "  ✗ 10-crash doctor extension failed\n    exited with status 4 at doctor.d/10-crash.sh:3: return 4\n"
         ),
         "{stdout}"
     );
