@@ -107,6 +107,7 @@ _dot_hook_phase=load
 _dot_hook_failure=()
 _dot_hook_return_note=()
 _dot_hook_return_site=
+_dot_hook_entry=
 _dot_hook_noted=()
 
 # Describe the failure at the caller's caller: frame 0 is this helper and
@@ -168,8 +169,23 @@ _dot_hook_note_failure() {
   _dot_hook_return_note=()
 }
 
-# Frames: 0 is this helper, 1 the returning function, 2 its caller.
+# Frames: 0 is this helper, 1 the returning function, 2 its caller. A
+# function that falls off its end after a nested `return N` still shows that
+# `return N` as its command, but on its own definition line, which names no
+# return the hook wrote; skip that shape so ERR reports the call instead. A
+# one-line entry point's real `return` is skipped too, since the two cannot be
+# told apart there. `declare -F` reports the definition line only under
+# `extdebug`; turning that off also turns errtrace off, so `set -E` is
+# restored. The query forks, but only on this failure path.
 _dot_hook_note_return() {
+  local name='' line=''
+  if [[ ${FUNCNAME[1]-} == "$_dot_hook_entry" ]]; then
+    shopt -s extdebug
+    read -r name line _ < <(declare -F "$_dot_hook_entry") || :
+    shopt -u extdebug
+    set -E
+    [[ ${BASH_LINENO[0]-} != "$line" ]] || return 0
+  fi
   _dot_hook_note '' "$1"
   _dot_hook_return_note=("${_dot_hook_noted[@]}")
   _dot_hook_return_site=${BASH_SOURCE[2]-}:${BASH_LINENO[1]-}
@@ -184,23 +200,34 @@ _dot_hook_report_failure() {
     >"$_dot_hook_failure_file" 2>/dev/null || :
 }
 
-# Arm the traps before the extension file loads. Functrace carries the RETURN
-# trap into every function. It notes only an explicit `return` that can
-# fail: `return N` other than a literal 0, or a bare `return` after a failing
-# command. A function that falls off its end on a failing command has no
-# return line to name, so ERR keeps reporting that command. The test in the
-# trap body itself skips a function call on the many successful returns a
-# hook makes (a variable `return $rc` is noted even when it is zero; that
-# only costs time). Each trap body stays on one
-# line: Bash adds a body's own line offset to the line it records for the
-# interrupted command, so a call on a later body line would point below the
-# `return` that fired it.
+# Arm the traps before the extension file loads. The RETURN trap notes only
+# an explicit `return` that can fail: `return N` other than a literal 0, or a
+# bare `return` after a failing command. A function that falls off its end on
+# a failing command has no return line to name, so ERR keeps reporting that
+# command. Each trap body stays on one line: Bash adds a body's own line
+# offset to the line it records for the interrupted command, so a call on a
+# later body line would point below the `return` that fired it.
+#
+# Only the entry point is traced (`_dot_hook_trace`), not every function
+# (`set -T`): functrace would also hand a hook's own function-local
+# `trap ... RETURN` cleanup to every function that hook calls, firing it on
+# the first nested return, and would run this trap on every return a hook
+# makes. A failing `return` in a nested function is therefore reported at its
+# call site in the entry point, which still names the failing path.
 _dot_hook_notes_enable() {
   trap '_dot_hook_note_failure "$?" "$BASH_COMMAND" "${PIPESTATUS[@]}"' ERR
   # shellcheck disable=SC2154 # Assigned by the trap body itself.
   trap '_dot_hook_return_status=$?; if [[ $BASH_COMMAND == "return "[!0]* || ($BASH_COMMAND == return && $_dot_hook_return_status != 0) ]]; then _dot_hook_note_return "$BASH_COMMAND"; fi' RETURN
   trap '_dot_hook_report_failure "$?" "$BASH_COMMAND"' EXIT
-  set -ET
+  set -E
+}
+
+# Give the entry point the trace attribute so the RETURN trap fires when it
+# returns. Deactivation never armed the traps, so it stays untraced.
+_dot_hook_trace() {
+  [[ $mode != deactivate ]] || return 0
+  _dot_hook_entry=$1
+  declare -ft "$1"
 }
 
 case $mode in
@@ -233,6 +260,7 @@ case $mode in
     fi
     printf 1 >"$result"
     _dot_hook_phase=run
+    _dot_hook_trace "$entry"
     "$entry"
     ;;
   doctor)
@@ -248,6 +276,7 @@ case $mode in
       exit 1
     fi
     _dot_hook_phase=run
+    _dot_hook_trace doctor
     doctor
     ;;
 esac

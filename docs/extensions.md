@@ -25,8 +25,9 @@ invocation; obsolete `bash-v1` bootstrap hints are not consulted. `dot doctor`
 uses the same cached probe when checking configured shell-hook or Shdeps
 capabilities. Workers use `--noprofile` and `--norc`, start in `$HOME`, close
 stdin, set `umask 077`, enable
-`errexit`/`nounset`/`pipefail`, clear every resettable trap, and start with
-`extglob`, `nocasematch`, and `nullglob` disabled. POSIX shell semantics do not
+`errexit`/`nounset`/`pipefail`, clear every resettable trap (merge, pre-sync,
+and doctor workers then arm their own failure-note traps, described below),
+and start with `extglob`, `nocasematch`, and `nullglob` disabled. POSIX shell semantics do not
 let a shell reset signals it inherited as ignored, so those exact host
 dispositions (notably GitHub runners' ignored `SIGPIPE`) can remain visible.
 Each worker receives a different private `TMPDIR`.
@@ -42,16 +43,21 @@ reach the coordinator or another extension. Merge hooks define `merge()`;
 pre-sync extensions define `prepare()`; doctor extensions define `doctor()`.
 All entry points receive no arguments.
 
-Merge, pre-sync, and doctor workers run their extension under `set -ET` with
-`ERR` and `RETURN` traps that note where a failure stopped it: the file, line,
-and command of a failing command under `set -e`, or of an explicit nonzero
-`return` (so a silent guard such as `[[ -f $file ]] || return 1` names its
-line). For a public helper that rejected its arguments the note names the line
-that called it and the helper's name. A failed merge hook shows the note as
-the last line of its output, a failed pre-sync extension as a line under its
-warning, and a failed doctor extension in its row. Replacing the `ERR`,
-`RETURN`, or `EXIT` trap leaves only the warning and exit status. Deactivation
-hooks run without these traps.
+Merge, pre-sync, and doctor workers run their extension with `errtrace`
+(`set -E`) and `ERR`, `RETURN`, and `EXIT` traps that note where a failure
+stopped it: the file, line, and command of a failing command under `set -e`,
+or of an explicit nonzero `return` in the entry point (so a silent guard such
+as `[[ -f $file ]] || return 1` in `prepare()` names its line). Only the entry
+point carries the trace attribute, so a function-local `trap ... RETURN` in a
+hook still fires only when its own function returns, and a failing `return`
+in a nested function, or a failure inside a public helper, is reported at the
+line in the entry point that called it. An entry point written on one line,
+or one that ends on a failing command after a nested failure, has no return
+line to name, so its note gives only the last command. A failed merge hook
+shows the note after its output, a failed pre-sync extension as a line under
+its warning, and a failed doctor extension in its row. A merge hook that
+printed nothing also records the note as its failure detail. Replacing the `ERR`, `RETURN`, or `EXIT` trap
+leaves the failure unlocated. Deactivation hooks run without these traps.
 
 A Git-backed overlay may also provide the repository-only entry point
 `dot/profile-deactivate`, defining `deactivate()`. Dot records only validated
@@ -286,9 +292,9 @@ an extension must work against both an older and a newer coordinator:
   with its exit status and, when a failing command under `set -e` or an
   explicit nonzero `return` stopped it, the file, line, and command (for a
   public helper that rejected its arguments, the line that called it and the
-  helper's name). For a pipeline
-  that fails under `pipefail` in an element other than its last, Bash exposes
-  only the last element's command and line, so the row shows
+  helper's name). For a pipeline that fails under `pipefail` in an element
+  other than its last, Bash exposes only the last element's command and
+  line, so the row shows
   `pipeline with statuses 1 0, ending in: <last command>` with each
   element's exit status. A file that fails while it is being sourced says so. The last lines of its captured
   output are listed below the row. Older coordinators showed only the

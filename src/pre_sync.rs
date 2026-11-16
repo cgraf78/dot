@@ -387,8 +387,11 @@ pub fn run(
             // A failing hook often prints nothing (a bare `|| return 1`), so
             // the worker's note is the only clue to which line stopped it.
             // The scratch directory is fresh per call, so any note is this
-            // call's own.
-            if let Some(note) = crate::doctor_orchestrator::FailureNote::read(&call.result) {
+            // call's own. A hook stopped by Ctrl-C did not fail on a line.
+            let note = (outcome == "failed")
+                .then(|| crate::doctor_orchestrator::FailureNote::read(&call.result))
+                .flatten();
+            if let Some(note) = note {
                 warnings.push(format!("    {}", String::from_utf8_lossy(&note.detail())));
             }
             let _ = std::fs::remove_dir_all(&temporary);

@@ -3924,6 +3924,28 @@ fn reconcile_collision_relinks(workload: Workload, stdout: Vec<u8>) -> Vec<u8> {
     reconciled
 }
 
+/// The failure note the native engine prints under the pre-sync refusal's
+/// warning. The pinned Bash baseline runs its own older hook runtime, which
+/// leaves no note, so this line is the one intentional stderr divergence
+/// (see docs/rust-port-performance.md).
+const NATIVE_PRE_SYNC_FAILURE_NOTE: &[u8] = b"    exited with status 7; last command: return 7\n";
+
+/// Drop the native pre-sync failure note from normalized `stderr`,
+/// requiring exactly one, so any other stderr difference still fails
+/// parity.
+fn reconcile_pre_sync_failure_note(workload: Workload, stderr: Vec<u8>) -> Vec<u8> {
+    if workload != Workload::PreSyncFailure {
+        return stderr;
+    }
+    assert_eq!(
+        occurrences(&stderr, NATIVE_PRE_SYNC_FAILURE_NOTE),
+        1,
+        "the native pre-sync failure note appears once: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    replace_bytes(&stderr, NATIVE_PRE_SYNC_FAILURE_NOTE, b"")
+}
+
 /// Non-overlapping occurrences of `needle` in `haystack`.
 fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
     let mut count = 0;
@@ -3956,7 +3978,10 @@ fn compare_outputs(
     );
     assert_eq!(
         normalize_output(&shell.output.stderr, &engines.shell, &clients.shell),
-        normalize_output(&rust.output.stderr, &engines.rust, &clients.rust),
+        reconcile_pre_sync_failure_note(
+            workload,
+            normalize_output(&rust.output.stderr, &engines.rust, &clients.rust)
+        ),
         "{} stderr parity",
         workload.label()
     );
@@ -6786,6 +6811,29 @@ fn collision_relink_rows_reconcile_only_for_the_collision_workload() {
     assert_eq!(
         reconcile_collision_relinks(Workload::DisjointClean, bash.clone()),
         bash
+    );
+}
+
+#[test]
+fn pre_sync_failure_note_reconciles_only_for_the_failure_workload() {
+    let native = b"  warning: pre-sync extension failed: 10-fail.sh\n    exited with status 7; last command: return 7\n".to_vec();
+    let bash = b"  warning: pre-sync extension failed: 10-fail.sh\n".to_vec();
+    assert_eq!(
+        reconcile_pre_sync_failure_note(Workload::PreSyncFailure, native.clone()),
+        bash
+    );
+    assert_eq!(
+        reconcile_pre_sync_failure_note(Workload::DisjointClean, native.clone()),
+        native
+    );
+}
+
+#[test]
+#[should_panic(expected = "native pre-sync failure note appears once")]
+fn pre_sync_failure_reconciliation_requires_the_note() {
+    reconcile_pre_sync_failure_note(
+        Workload::PreSyncFailure,
+        b"  warning: pre-sync extension failed: 10-fail.sh\n".to_vec(),
     );
 }
 

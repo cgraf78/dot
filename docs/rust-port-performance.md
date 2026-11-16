@@ -95,7 +95,11 @@ stdout divergence, and the three extra relinks per Bash run slightly favor the
 native ratio. The current provider must retain the historical shell lock's
 ABI; the two lock revisions may differ. Running the same current provider
 through both clients checks that compatibility. A separate pre-sync refusal measures a representative failure
-without allowing state mutation. Shell and Rust use separate HOME, XDG config,
+without allowing state mutation. Its native warning is followed by the failing
+hook's note (`exited with status 7; last command: return 7`), which the Bash
+baseline's older hook runtime never printed; the harness requires
+exactly that one line and drops it before comparing stderr, the one intentional
+stderr divergence. Shell and Rust use separate HOME, XDG config,
 data, state, cache, and temporary roots, but each scenario shares the same
 local bare remotes. Pair order alternates on every iteration, producing 15
 shell-first and 15 Rust-first samples.

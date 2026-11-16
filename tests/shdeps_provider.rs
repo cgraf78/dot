@@ -6410,7 +6410,8 @@ fn a_hand_run_update_that_does_not_converge_records_a_plain_failure() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(last_run_fields(&fixture), ["fail", "manual"]);
     // Both causes are kept, in run order: the provider item, then the
-    // failing hook's key (it printed nothing, so no detail).
+    // failing hook's key. The hook printed nothing, so its detail is the
+    // worker's note (a one-line entry point gives no line, only the command).
     let items = last_failure_items(&fixture);
     let stages: Vec<(&str, &str)> = items
         .iter()
@@ -6419,6 +6420,10 @@ fn a_hand_run_update_that_does_not_converge_records_a_plain_failure() {
     assert_eq!(
         stages,
         [("tools", "ripgrep"), ("configs", "10-fail")],
+        "{items:?}"
+    );
+    assert_eq!(
+        items[1].2, "exited with status 3; last command: return 3",
         "{items:?}"
     );
 }
