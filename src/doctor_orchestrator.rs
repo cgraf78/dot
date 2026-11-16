@@ -472,6 +472,13 @@ impl FailureNote {
         })
     }
 
+    /// The note as one detail line, `exited with status N at <file>:<line>:
+    /// <command>` (or its top-level variants), for consumers that know no
+    /// exit status beyond the note's own.
+    pub fn detail(&self) -> Vec<u8> {
+        exit_detail(self.status, Some(self))
+    }
+
     /// Read the note a worker left for `result`, if any.
     pub fn read(result: &Path) -> Option<Self> {
         use std::io::Read as _;

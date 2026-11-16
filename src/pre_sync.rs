@@ -255,7 +255,9 @@ pub type Runner<'a> = dyn FnMut(&Call) -> bool + 'a;
 pub struct Outcome {
     /// Shell exit status: 0, or 1 after the first worker failure.
     pub status: i32,
-    /// `  warning: pre-sync extension failed: {name}` per failure.
+    /// `  warning: pre-sync extension failed: {name}` per failure, followed
+    /// by `    exited with status N at <file>:<line>: <command>` when the
+    /// worker left a failure note.
     pub warnings: Vec<String>,
 }
 
@@ -382,6 +384,13 @@ pub fn run(
                 "  warning: pre-sync extension {outcome}: {}",
                 basename(&spec.script)
             ));
+            // A failing hook often prints nothing (a bare `|| return 1`), so
+            // the worker's note is the only clue to which line stopped it.
+            // The scratch directory is fresh per call, so any note is this
+            // call's own.
+            if let Some(note) = crate::doctor_orchestrator::FailureNote::read(&call.result) {
+                warnings.push(format!("    {}", String::from_utf8_lossy(&note.detail())));
+            }
             let _ = std::fs::remove_dir_all(&temporary);
             status = 1;
             break;

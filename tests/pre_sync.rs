@@ -240,6 +240,47 @@ fn run_orchestration_agrees() {
 }
 
 #[test]
+fn failure_note_follows_the_warning() {
+    // A failing worker leaves `$result.failure`; the warning then names the
+    // line that stopped it. The scratch directory still goes away.
+    let (dir, ext) = fixture("presync-note-native", &["10-a.sh", "20-b.sh"]);
+    let scratch = dir.path().join("scratch");
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    let mut runner = |call: &pre_sync::Call| {
+        if call.key.starts_with("10-a") {
+            return true;
+        }
+        std::fs::write(
+            dot::doctor_orchestrator::failure_path(&call.result),
+            b"7\0run\0pre-sync.d/20-b.sh:4\0return 7",
+        )
+        .expect("note");
+        false
+    };
+    let outcome = pre_sync::run(
+        "prepare",
+        &[],
+        &inputs(dir.path(), &ext),
+        &[],
+        &scratch,
+        &mut runner,
+    )
+    .expect("outcome");
+    assert_eq!(outcome.status, 1);
+    assert_eq!(
+        outcome.warnings,
+        vec![
+            "  warning: pre-sync extension failed: 20-b.sh",
+            "    exited with status 7 at pre-sync.d/20-b.sh:4: return 7",
+        ]
+    );
+    assert_eq!(
+        std::fs::read_dir(&scratch).expect("scratch list").count(),
+        0
+    );
+}
+
+#[test]
 fn run_records_agree() {
     let (dir, ext) = fixture("presync-record-native", &["10-a.sh", "20-b.sh"]);
     let record = format!(

@@ -113,10 +113,13 @@ assert_eq $'alpha\nbarrier\nbeta' "$(<"$home/hook.log")" \
 # The base updates before profile policy is reloaded. Pre-sync is then a strict
 # serial gate before any selected overlay transport or later convergence.
 rm -f "$extensions/pre-sync.d"/*.sh "$home/pre-sync.log"
+# A silent guard (`[[ ... ]] ||` then `return` on the next line) is the shape
+# that used to fail with no clue: the warning must name the `return` line.
 cat >"$extensions/pre-sync.d/10-failing.sh" <<'HOOK'
 prepare() {
   printf 'failing\n' >>"$HOME/pre-sync.log"
-  return 7
+  [[ -e $HOME/pre-sync-missing ]] ||
+    return 7
 }
 HOOK
 cat >"$extensions/pre-sync.d/20-later.sh" <<'HOOK'
@@ -126,10 +129,12 @@ chmod 0644 "$extensions/pre-sync.d"/*.sh
 head_before=$(git --git-dir="$home/.dotfiles" rev-parse HEAD)
 fixture_push hooks main README.md $'hooks-two\n' 100644
 set +e
-run_dot "$home" "$state" update >/dev/null 2>&1
+pre_sync_output=$(run_dot "$home" "$state" update 2>&1)
 pre_sync_status=$?
 set -e
 assert_eq 1 "$pre_sync_status" 'failed pre-sync extension aborts update'
+assert_contains $'  warning: pre-sync extension failed: 10-failing.sh\n    exited with status 7 at pre-sync.d/10-failing.sh:4: return 7' \
+  "$pre_sync_output" 'pre-sync failure names the return line that stopped it'
 assert_eq failing "$(<"$home/pre-sync.log")" \
   'pre-sync failure stops later preparation extensions'
 [[ $head_before != "$(git --git-dir="$home/.dotfiles" rev-parse HEAD)" ]] ||
@@ -166,8 +171,9 @@ failing_hook_status=$?
 set -e
 assert_eq 1 "$failing_hook_status" \
   'real failing merge hook normalizes aggregate update status to one'
-assert_contains 'warning: merge failed: 10-failing' "$failing_hook_output" \
-  'empty merge failure identifies its stable hook key'
+assert_contains $'  10-failing output:\n    exited with status 42 at merge-hooks.d/10-failing.sh:3: return 42\n  warning: merge failed' \
+  "$failing_hook_output" \
+  'silent merge failure names its hook and the return line that stopped it'
 # Hooks in one batch deliberately run concurrently. Their direct side effects
 # have no declaration-order contract; ordered replay applies to engine-owned
 # result records. Require both exact effects without making scheduler order a

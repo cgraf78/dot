@@ -82,6 +82,127 @@ if [[ $mode == pre-sync ]]; then
 fi
 
 unset -f merge prepare deactivate doctor 2>/dev/null || true
+
+# Failure notes for doctor, merge, and pre-sync extensions. Under `set -e` a
+# failing command ends the extension with no output, which surfaces as a bare
+# failure row. The ERR trap notes the last failure in this shell (errtrace
+# carries it into functions); the EXIT trap hands the note to the coordinator
+# only when the worker fails. An explicit `exit` other than the noted command
+# means the note is about a failure the extension tolerated under `set +e`, so
+# it is dropped; any other failing command overwrites the note itself, and
+# inside a sourced file or `eval` the exit-time command is the enclosing one,
+# so only `exit` can be compared. The note lives in shell variables because
+# subshells and command substitutions, where a failing command does not stop
+# the extension, must not leave one behind. It names the innermost frame
+# outside Dot's own runtime: a helper that rejects its arguments fails inside
+# the public API, but the fix belongs on the extension line that called it.
+# Reaching this file's own top level means the extension file failed to load,
+# or the entry point itself returned the status; only the phase and last
+# command are known then. The note path is the coordinator's
+# `doctor_orchestrator::failure_path`; deriving it from the readonly result
+# path keeps an extension's own `result` variable out of it.
+_dot_hook_failure_file=$result.failure
+readonly _dot_hook_failure_file
+_dot_hook_phase=load
+_dot_hook_failure=()
+_dot_hook_return_note=()
+_dot_hook_return_site=
+_dot_hook_noted=()
+
+# Describe the failure at the caller's caller: frame 0 is this helper and
+# frame 1 the trap handler that called it, so the walk starts at frame 2.
+_dot_hook_note() {
+  local status=$1 command=$2 frame where='' root=${DOT_EXTENSIONS_DIR:-}
+  local -a pipe=("${@:3}")
+  # `${pipe[*]}` joins with IFS; the extension's own IFS must not leak.
+  local IFS=' '
+  root=${root%/}
+  # Under `pipefail` a pipeline whose last element succeeded failed in an
+  # earlier one, yet Bash names only the last element (and its line):
+  # the earlier element ran in a subshell whose own ERR trap is gone.
+  # Mark the pipeline and list each element's status rather than blame
+  # a command that succeeded; the statuses lead so the coordinator's
+  # length cap cannot cut them. Statuses that are all zero belong to an
+  # earlier pipeline (a redirection on a group can fail after it), and
+  # `[[` and `((` leave the previous pipeline's statuses in place, so
+  # neither counts. A public helper's name below still wins.
+  if ((${#pipe[@]} > 1)) && [[ ${pipe[${#pipe[@]} - 1]} == 0 &&
+    " ${pipe[*]} " == *[1-9]* && $command != '[['* &&
+    $command != '(('* ]]; then
+    command="pipeline with statuses ${pipe[*]}, ending in: $command"
+  fi
+  for ((frame = 2; frame < ${#BASH_SOURCE[@]}; frame++)); do
+    case ${BASH_SOURCE[frame]} in
+      "$0") break ;;
+      "$DOT_SOURCE_ROOT"/lib/dot/*) command=${FUNCNAME[frame]} ;;
+      *)
+        where=${BASH_SOURCE[frame]}
+        [[ -z $root ]] || where=${where#"$root"/}
+        where+=:${BASH_LINENO[frame - 1]}
+        break
+        ;;
+    esac
+  done
+  # The worker's own `. "$script"` line says nothing about the cause.
+  [[ -n $where || $_dot_hook_phase != load ]] || command=
+  _dot_hook_noted=("$status" "$_dot_hook_phase" "$where" "$command" "$2")
+}
+
+# ERR fires after a failing `return N` has already unwound to the caller, so
+# its own frames point at the call site. The RETURN trap that ran just before
+# it saw the `return` line itself. That trap cannot see the returned status
+# (its `$?` is the status of the command before `return`), so it records the
+# return's command text and its function's call site instead, and ERR adopts
+# that note, with its own status, only when it is that same return arriving:
+# the same command, failing at that call site. A note left behind by a
+# handled failure elsewhere never matches.
+_dot_hook_note_failure() {
+  if ((${#_dot_hook_return_note[@]} == 5)) &&
+    [[ ${_dot_hook_return_note[4]} == "$2" &&
+      $_dot_hook_return_site == "${BASH_SOURCE[1]-}:${BASH_LINENO[0]-}" ]]; then
+    _dot_hook_failure=("$1" "${_dot_hook_return_note[@]:1}")
+  else
+    _dot_hook_note "$@"
+    _dot_hook_failure=("${_dot_hook_noted[@]}")
+  fi
+  _dot_hook_return_note=()
+}
+
+# Frames: 0 is this helper, 1 the returning function, 2 its caller.
+_dot_hook_note_return() {
+  _dot_hook_note '' "$1"
+  _dot_hook_return_note=("${_dot_hook_noted[@]}")
+  _dot_hook_return_site=${BASH_SOURCE[2]-}:${BASH_LINENO[1]-}
+}
+
+_dot_hook_report_failure() {
+  [[ $1 -ne 0 && ${#_dot_hook_failure[@]} -eq 5 ]] || return 0
+  case $2 in
+    exit | 'exit '*) [[ $2 == "${_dot_hook_failure[4]}" ]] || return 0 ;;
+  esac
+  printf '%s\0%s\0%s\0%s' "${_dot_hook_failure[@]:0:4}" \
+    >"$_dot_hook_failure_file" 2>/dev/null || :
+}
+
+# Arm the traps before the extension file loads. Functrace carries the RETURN
+# trap into every function. It notes only an explicit `return` that can
+# fail: `return N` other than a literal 0, or a bare `return` after a failing
+# command. A function that falls off its end on a failing command has no
+# return line to name, so ERR keeps reporting that command. The test in the
+# trap body itself skips a function call on the many successful returns a
+# hook makes (a variable `return $rc` is noted even when it is zero; that
+# only costs time). Each trap body stays on one
+# line: Bash adds a body's own line offset to the line it records for the
+# interrupted command, so a call on a later body line would point below the
+# `return` that fired it.
+_dot_hook_notes_enable() {
+  trap '_dot_hook_note_failure "$?" "$BASH_COMMAND" "${PIPESTATUS[@]}"' ERR
+  # shellcheck disable=SC2154 # Assigned by the trap body itself.
+  trap '_dot_hook_return_status=$?; if [[ $BASH_COMMAND == "return "[!0]* || ($BASH_COMMAND == return && $_dot_hook_return_status != 0) ]]; then _dot_hook_note_return "$BASH_COMMAND"; fi' RETURN
+  trap '_dot_hook_report_failure "$?" "$BASH_COMMAND"' EXIT
+  set -ET
+}
+
 case $mode in
   merge | pre-sync | deactivate)
     # shellcheck source=log.sh
@@ -96,6 +217,9 @@ case $mode in
     . "$DOT_SOURCE_ROOT/lib/dot/public/hook-runtime-v1/merge-hooks.sh"
     # shellcheck source=hook-api.sh
     . "$DOT_SOURCE_ROOT/lib/dot/public/hook-runtime-v1/hook-api.sh"
+    # Deactivation's coordinator reads no failure note, so it keeps the
+    # historical trap-free environment.
+    [[ $mode == deactivate ]] || _dot_hook_notes_enable
     if ! . "$script"; then
       printf 1 >"$result"
       exit 1
@@ -108,6 +232,7 @@ case $mode in
       exit 1
     fi
     printf 1 >"$result"
+    _dot_hook_phase=run
     "$entry"
     ;;
   doctor)
@@ -116,82 +241,13 @@ case $mode in
     DOT_DOCTOR_RESULT_FILE=$result
     readonly DOT_DOCTOR_RESULT_FILE
     export DOT_DOCTOR_RESULT_FILE
-    # Under `set -e` a failing command ends the extension with no output,
-    # which used to surface as an empty failure row. The ERR trap notes the
-    # last failure in this shell (errtrace carries it into functions); the
-    # EXIT trap hands the note to the coordinator only when the worker
-    # fails. An explicit `exit` other than the noted command means the note
-    # is about a failure the extension tolerated under `set +e`, so it is
-    # dropped; any other failing command, `return` included, overwrites the
-    # note itself, and inside a sourced file or `eval` the exit-time command
-    # is the enclosing one, so only `exit` can be compared. The note lives in
-    # shell variables because subshells and command substitutions, where a
-    # failing command does not stop the extension, must not leave one
-    # behind. It names the innermost frame outside Dot's own runtime: a
-    # helper that rejects its arguments fails inside the public API, but the
-    # fix belongs on the extension line that called it. Reaching this file's
-    # own top level means the extension file failed to load, or `doctor`
-    # itself returned the status; only the phase and last command are known
-    # then. The note path is the coordinator's
-    # `doctor_orchestrator::failure_path`; deriving it from the readonly
-    # result path keeps an extension's own `result` variable out of it.
-    _dot_doctor_failure_file=$DOT_DOCTOR_RESULT_FILE.failure
-    readonly _dot_doctor_failure_file
-    _dot_doctor_phase=load
-    _dot_doctor_failure=()
-    _dot_doctor_note_failure() {
-      local status=$1 command=$2 frame where='' root=${DOT_EXTENSIONS_DIR:-}
-      local -a pipe=("${@:3}")
-      # `${pipe[*]}` joins with IFS; the extension's own IFS must not leak.
-      local IFS=' '
-      root=${root%/}
-      # Under `pipefail` a pipeline whose last element succeeded failed in an
-      # earlier one, yet Bash names only the last element (and its line):
-      # the earlier element ran in a subshell whose own ERR trap is gone.
-      # Mark the pipeline and list each element's status rather than blame
-      # a command that succeeded; the statuses lead so the coordinator's
-      # length cap cannot cut them. Statuses that are all zero belong to an
-      # earlier pipeline (a redirection on a group can fail after it), and
-      # `[[` and `((` leave the previous pipeline's statuses in place, so
-      # neither counts. A public helper's name below still wins.
-      if ((${#pipe[@]} > 1)) && [[ ${pipe[${#pipe[@]} - 1]} == 0 &&
-        " ${pipe[*]} " == *[1-9]* && $command != '[['* &&
-        $command != '(('* ]]; then
-        command="pipeline with statuses ${pipe[*]}, ending in: $command"
-      fi
-      for ((frame = 1; frame < ${#BASH_SOURCE[@]}; frame++)); do
-        case ${BASH_SOURCE[frame]} in
-          "$0") break ;;
-          "$DOT_SOURCE_ROOT"/lib/dot/*) command=${FUNCNAME[frame]} ;;
-          *)
-            where=${BASH_SOURCE[frame]}
-            [[ -z $root ]] || where=${where#"$root"/}
-            where+=:${BASH_LINENO[frame - 1]}
-            break
-            ;;
-        esac
-      done
-      # The worker's own `. "$script"` line says nothing about the cause.
-      [[ -n $where || $_dot_doctor_phase != load ]] || command=
-      _dot_doctor_failure=("$status" "$_dot_doctor_phase" "$where" "$command" "$2")
-    }
-    _dot_doctor_report_failure() {
-      [[ $1 -ne 0 && ${#_dot_doctor_failure[@]} -eq 5 ]] || return 0
-      case $2 in
-        exit | 'exit '*) [[ $2 == "${_dot_doctor_failure[4]}" ]] || return 0 ;;
-      esac
-      printf '%s\0%s\0%s\0%s' "${_dot_doctor_failure[@]:0:4}" \
-        >"$_dot_doctor_failure_file" 2>/dev/null || :
-    }
-    trap '_dot_doctor_note_failure "$?" "$BASH_COMMAND" "${PIPESTATUS[@]}"' ERR
-    trap '_dot_doctor_report_failure "$?" "$BASH_COMMAND"' EXIT
-    set -E
+    _dot_hook_notes_enable
     . "$script"
     if ! declare -F doctor >/dev/null; then
       printf 'dot: %s defines no doctor function\n' "${script##*/}" >&2
       exit 1
     fi
-    _dot_doctor_phase=run
+    _dot_hook_phase=run
     doctor
     ;;
 esac

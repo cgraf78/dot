@@ -684,9 +684,12 @@ fn run_one(
         };
     }
     let result = root.join(format!("{index:03}.has_merge"));
+    let note_path = crate::doctor_orchestrator::failure_path(&result);
     // Serial barriers reuse the batch-local worker numbers. A failed worker
-    // must not inherit a prior batch's marker and look as though it ran.
+    // must not inherit a prior batch's marker and look as though it ran, nor
+    // a prior batch's failure note and blame that hook's line.
     let _ = std::fs::remove_file(&result);
+    let _ = std::fs::remove_file(&note_path);
     let created = crate::overlay_context::create_current(
         &temporary,
         "merge",
@@ -697,7 +700,7 @@ fn run_one(
         inputs.extension_inputs.euid,
     );
     let started = Instant::now();
-    let (rc, output) = match created {
+    let (rc, mut output) = match created {
         Ok((context, token)) => {
             let mut worker = crate::hook_worker::Worker::for_update(
                 inputs.runtime,
@@ -718,6 +721,22 @@ fn run_one(
     let has_merge = std::fs::read_to_string(&result)
         .ok()
         .is_some_and(|value| value.trim() == "1");
+    // A failing hook often prints nothing (a bare `|| return 1`), so append
+    // the worker's note as the capture's last line: the failure rendering
+    // shows it under the hook, and the recorded failure detail (the
+    // capture's last line) names the line that stopped the hook.
+    let note = (rc != 0)
+        .then(|| crate::doctor_orchestrator::FailureNote::read(&result))
+        .flatten()
+        .filter(|note| note.status == rc);
+    if let Some(note) = note {
+        if !output.is_empty() && !output.ends_with(b"\n") {
+            output.push(b'\n');
+        }
+        output.extend_from_slice(&note.detail());
+        output.push(b'\n');
+    }
+    let _ = std::fs::remove_file(&note_path);
     let _ = std::fs::remove_dir_all(&temporary);
     ResultRecord {
         hook,

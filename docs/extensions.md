@@ -42,6 +42,17 @@ reach the coordinator or another extension. Merge hooks define `merge()`;
 pre-sync extensions define `prepare()`; doctor extensions define `doctor()`.
 All entry points receive no arguments.
 
+Merge, pre-sync, and doctor workers run their extension under `set -ET` with
+`ERR` and `RETURN` traps that note where a failure stopped it: the file, line,
+and command of a failing command under `set -e`, or of an explicit nonzero
+`return` (so a silent guard such as `[[ -f $file ]] || return 1` names its
+line). For a public helper that rejected its arguments the note names the line
+that called it and the helper's name. A failed merge hook shows the note as
+the last line of its output, a failed pre-sync extension as a line under its
+warning, and a failed doctor extension in its row. Replacing the `ERR`,
+`RETURN`, or `EXIT` trap leaves only the warning and exit status. Deactivation
+hooks run without these traps.
+
 A Git-backed overlay may also provide the repository-only entry point
 `dot/profile-deactivate`, defining `deactivate()`. Dot records only validated
 Git overlays that provide this file. When a later profile deselects one, the
@@ -272,9 +283,10 @@ an extension must work against both an older and a newer coordinator:
   extensions still run, including the first claimant of a duplicated
   identity. Older coordinators ran no extension at all in this case.
 - An extension that exits nonzero gets a `<name> doctor extension failed` row
-  with its exit status and, when a failing command under `set -e` stopped
-  it, the file, line, and command (for a public helper that rejected its
-  arguments, the line that called it and the helper's name). For a pipeline
+  with its exit status and, when a failing command under `set -e` or an
+  explicit nonzero `return` stopped it, the file, line, and command (for a
+  public helper that rejected its arguments, the line that called it and the
+  helper's name). For a pipeline
   that fails under `pipefail` in an element other than its last, Bash exposes
   only the last element's command and line, so the row shows
   `pipeline with statuses 1 0, ending in: <last command>` with each
