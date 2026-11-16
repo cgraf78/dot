@@ -674,12 +674,20 @@ impl ResultRecord {
 
     /// The recorded failure detail. A hook's own last line usually names the
     /// cause (hooks warn just before they fail), so it wins; the note stands
-    /// in only for a hook that printed nothing.
+    /// in for a hook that printed nothing but its opening title (`Git`),
+    /// which names the hook rather than the cause.
     fn failure_detail(&self) -> String {
         let own = crate::update_status::last_line(&self.output);
-        match &self.note {
-            Some(note) if own.is_empty() => crate::update_status::last_line(note),
-            _ => own,
+        let Some(note) = &self.note else {
+            return own;
+        };
+        let (first, rest) = result_label_bytes(&self.hook.key, &self.output);
+        let title_only =
+            rest.is_empty() && names_hook(&first, label_from_script(&self.hook.key).as_bytes());
+        if own.is_empty() || title_only {
+            crate::update_status::last_line(note)
+        } else {
+            own
         }
     }
 }
@@ -1319,7 +1327,8 @@ mod tests {
     fn failure_note_renders_under_the_hook_and_fills_silent_details() {
         // A silent failure (a bare `|| return 1`) shows only the note, which
         // also becomes its recorded detail; a hook that warned before failing
-        // keeps its own warning as the detail, with the note rendered after.
+        // keeps its own warning as the detail, with the note rendered after;
+        // a hook that printed only its title records the note too.
         let scope = TempDir::new("merge-failure-note").expect("fixture");
         let env = BTreeMap::from([
             (OsString::from("HOME"), scope.path().as_os_str().to_owned()),
@@ -1381,13 +1390,18 @@ mod tests {
                     b"warning: cannot parse settings",
                     b"exited with status 1 at merge-hooks.d/20-loud.sh:9: return 1",
                 ),
+                failed(
+                    "30-sapling",
+                    b"Sapling\n",
+                    b"exited with status 1 at merge-hooks.d/30-sapling.sh:5: return 1",
+                ),
             ],
             &inputs,
             &mut out,
             &mut err,
             &mut failures,
         );
-        assert_eq!(counts, (2, 2));
+        assert_eq!(counts, (3, 3));
         assert!(out.is_empty());
         assert_eq!(
             String::from_utf8(err).unwrap(),
@@ -1397,6 +1411,10 @@ mod tests {
              \x20 20-loud output:\n\
              \x20   warning: cannot parse settings\n\
              \x20   exited with status 1 at merge-hooks.d/20-loud.sh:9: return 1\n\
+             \x20 warning: merge failed\n\
+             \x20 30-sapling output:\n\
+             \x20   Sapling\n\
+             \x20   exited with status 1 at merge-hooks.d/30-sapling.sh:5: return 1\n\
              \x20 warning: merge failed\n"
         );
         assert_eq!(
@@ -1409,6 +1427,10 @@ mod tests {
                 (
                     "20-loud".to_string(),
                     "warning: cannot parse settings".to_string()
+                ),
+                (
+                    "30-sapling".to_string(),
+                    "exited with status 1 at merge-hooks.d/30-sapling.sh:5: return 1".to_string()
                 ),
             ]
         );

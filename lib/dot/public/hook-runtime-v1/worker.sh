@@ -107,6 +107,8 @@ _dot_hook_phase=load
 _dot_hook_failure=()
 _dot_hook_return_note=()
 _dot_hook_return_site=
+_dot_hook_return_function=
+_dot_hook_return_line=
 _dot_hook_entry=
 _dot_hook_noted=()
 
@@ -157,10 +159,17 @@ _dot_hook_note() {
 # that note, with its own status, only when it is that same return arriving:
 # the same command, failing at that call site. A note left behind by a
 # handled failure elsewhere never matches.
+#
+# An entry point that falls off its end after a nested `return N` still shows
+# that `return N` as its command, but on its own definition line, which names
+# no return the hook wrote, so that note is not adopted and ERR reports the
+# call instead. A one-line entry point's real `return` falls back the same
+# way, since the two cannot be told apart there.
 _dot_hook_note_failure() {
   if ((${#_dot_hook_return_note[@]} == 5)) &&
     [[ ${_dot_hook_return_note[4]} == "$2" &&
-      $_dot_hook_return_site == "${BASH_SOURCE[1]-}:${BASH_LINENO[0]-}" ]]; then
+      $_dot_hook_return_site == "${BASH_SOURCE[1]-}:${BASH_LINENO[0]-}" ]] &&
+    _dot_hook_return_located; then
     _dot_hook_failure=("$1" "${_dot_hook_return_note[@]:1}")
   else
     _dot_hook_note "$@"
@@ -169,26 +178,34 @@ _dot_hook_note_failure() {
   _dot_hook_return_note=()
 }
 
-# Frames: 0 is this helper, 1 the returning function, 2 its caller. A
-# function that falls off its end after a nested `return N` still shows that
-# `return N` as its command, but on its own definition line, which names no
-# return the hook wrote; skip that shape so ERR reports the call instead. A
-# one-line entry point's real `return` is skipped too, since the two cannot be
-# told apart there. `declare -F` reports the definition line only under
-# `extdebug`; turning that off also turns errtrace off, so `set -E` is
-# restored. The query forks, but only on this failure path.
-_dot_hook_note_return() {
-  local name='' line=''
-  if [[ ${FUNCNAME[1]-} == "$_dot_hook_entry" ]]; then
-    shopt -s extdebug
-    read -r name line _ < <(declare -F "$_dot_hook_entry") || :
+# Whether the pending return note names a real `return` line: anything but
+# the entry point's own definition line (see above). `declare -F` reports
+# that line only under `extdebug`, and turning `extdebug` off also clears
+# errtrace and functrace, so the hook's own settings are restored exactly.
+# This runs only when ERR is about to adopt a note.
+_dot_hook_return_located() {
+  local had_extdebug=0 flags=$- name='' line=''
+  [[ $_dot_hook_return_function == "$_dot_hook_entry" ]] || return 0
+  shopt -q extdebug && had_extdebug=1
+  ((had_extdebug)) || shopt -s extdebug
+  read -r name line _ < <(declare -F "$_dot_hook_entry") || :
+  if ((!had_extdebug)); then
     shopt -u extdebug
-    set -E
-    [[ ${BASH_LINENO[0]-} != "$line" ]] || return 0
+    if [[ $flags == *E* ]]; then set -E; else set +E; fi
+    if [[ $flags == *T* ]]; then set -T; else set +T; fi
   fi
+  # A lookup that found nothing (the hook unset its entry) cannot rule the
+  # shape out, so the note is not trusted either.
+  [[ -n $line && $_dot_hook_return_line != "$line" ]]
+}
+
+# Frames: 0 is this helper, 1 the returning function, 2 its caller.
+_dot_hook_note_return() {
   _dot_hook_note '' "$1"
   _dot_hook_return_note=("${_dot_hook_noted[@]}")
   _dot_hook_return_site=${BASH_SOURCE[2]-}:${BASH_LINENO[1]-}
+  _dot_hook_return_function=${FUNCNAME[1]-}
+  _dot_hook_return_line=${BASH_LINENO[0]-}
 }
 
 _dot_hook_report_failure() {

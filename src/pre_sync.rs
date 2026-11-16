@@ -375,11 +375,8 @@ pub fn run(
         };
         if !runner(&call) {
             // One stopped by Ctrl-C did not fail on its own.
-            let outcome = if crate::cleanup::received_signal().is_some() {
-                "interrupted"
-            } else {
-                "failed"
-            };
+            let interrupted = crate::cleanup::received_signal().is_some();
+            let outcome = if interrupted { "interrupted" } else { "failed" };
             warnings.push(format!(
                 "  warning: pre-sync extension {outcome}: {}",
                 basename(&spec.script)
@@ -388,7 +385,7 @@ pub fn run(
             // the worker's note is the only clue to which line stopped it.
             // The scratch directory is fresh per call, so any note is this
             // call's own. A hook stopped by Ctrl-C did not fail on a line.
-            let note = (outcome == "failed")
+            let note = (!interrupted)
                 .then(|| crate::doctor_orchestrator::FailureNote::read(&call.result))
                 .flatten();
             if let Some(note) = note {

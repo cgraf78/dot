@@ -27,10 +27,10 @@ capabilities. Workers use `--noprofile` and `--norc`, start in `$HOME`, close
 stdin, set `umask 077`, enable
 `errexit`/`nounset`/`pipefail`, clear every resettable trap (merge, pre-sync,
 and doctor workers then arm their own failure-note traps, described below),
-and start with `extglob`, `nocasematch`, and `nullglob` disabled. POSIX shell semantics do not
-let a shell reset signals it inherited as ignored, so those exact host
-dispositions (notably GitHub runners' ignored `SIGPIPE`) can remain visible.
-Each worker receives a different private `TMPDIR`.
+and start with `extglob`, `nocasematch`, and `nullglob` disabled. POSIX shell
+semantics do not let a shell reset signals it inherited as ignored, so those
+exact host dispositions (notably GitHub runners' ignored `SIGPIPE`) can remain
+visible. Each worker receives a different private `TMPDIR`.
 
 Ordinary exported client variables remain available because configuration
 policy can legitimately depend on platform and tool context. Bash startup and
@@ -47,17 +47,24 @@ Merge, pre-sync, and doctor workers run their extension with `errtrace`
 (`set -E`) and `ERR`, `RETURN`, and `EXIT` traps that note where a failure
 stopped it: the file, line, and command of a failing command under `set -e`,
 or of an explicit nonzero `return` in the entry point (so a silent guard such
-as `[[ -f $file ]] || return 1` in `prepare()` names its line). Only the entry
-point carries the trace attribute, so a function-local `trap ... RETURN` in a
-hook still fires only when its own function returns, and a failing `return`
-in a nested function, or a failure inside a public helper, is reported at the
-line in the entry point that called it. An entry point written on one line,
-or one that ends on a failing command after a nested failure, has no return
-line to name, so its note gives only the last command. A failed merge hook
-shows the note after its output, a failed pre-sync extension as a line under
-its warning, and a failed doctor extension in its row. A merge hook that
-printed nothing also records the note as its failure detail. Replacing the `ERR`, `RETURN`, or `EXIT` trap
-leaves the failure unlocated. Deactivation hooks run without these traps.
+as `[[ -f $file ]] || return 1` in `prepare()` names its line). A failing
+`return` in a nested function, or a failure inside a public helper, is
+reported at the line in the entry point that called it. An entry point
+written on one line, or one that ends on a failing command after a nested
+failure, has no return line to name, so its note gives only the last command.
+A failed merge hook shows the note after its output, a failed pre-sync
+extension as a line under its warning, and a failed doctor extension in its
+row. A merge hook that printed nothing, or only its title, also records the
+note as its failure detail.
+
+Only the entry point carries the trace attribute (`declare -ft`), not every
+function (`set -T`), so a `trap ... RETURN` that a hook sets inside a helper
+fires only on returns from that helper and the entry point, never on returns
+from functions the helper calls. Two consequences of tracing the entry point:
+a `RETURN` or `DEBUG` trap the hook sets at file level also fires inside, or
+on return from, the entry point; and a `RETURN` trap the hook leaves armed
+replaces the worker's, as does replacing `ERR` or `EXIT`, which leaves later
+failures unlocated. Deactivation hooks run without these traps.
 
 A Git-backed overlay may also provide the repository-only entry point
 `dot/profile-deactivate`, defining `deactivate()`. Dot records only validated
