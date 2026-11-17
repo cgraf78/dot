@@ -60,7 +60,10 @@ if pid == 0:
                 os.kill(dot, signal.SIGCONT)
     signal.signal(signal.SIGTTOU, signal.SIG_IGN)
     os.tcsetpgrp(0, os.getpgrp())
-    print('terminal-restored=' + str(termios.tcgetattr(0) == original), flush=True)
+    restored = termios.tcgetattr(0)
+    if restored != original:
+        print('terminal-diff=' + repr([(i, before, after) for i, (before, after) in enumerate(zip(original, restored)) if before != after]), flush=True)
+    print('terminal-restored=' + str(restored == original), flush=True)
     code = os.waitstatus_to_exitcode(status)
     sys.exit(code if code >= 0 else 128 - code)
 output = bytearray()

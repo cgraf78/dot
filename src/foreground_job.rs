@@ -20,7 +20,13 @@ pub(super) fn run(
     reader: ForwardReader,
     writer: Stdio,
 ) -> i32 {
-    session_end_status(supervise(command, sink, reader, writer))
+    let result = supervise(command, sink, reader, writer);
+    if let Err(error) = &result {
+        // Terminal handoff and job-control failures otherwise collapse to a
+        // generic 127, hiding the OS evidence needed to diagnose the failure.
+        eprintln!("dot: foreground Git job failed: {error}");
+    }
+    session_end_status(result)
 }
 
 fn supervise(
@@ -78,9 +84,13 @@ fn supervise(
                 output.tick(true)?;
                 return Ok(true);
             }
-            if job.stopped()? {
+            if job.stopped().map_err(|error| {
+                std::io::Error::new(error.kind(), format!("observe job stop: {error}"))
+            })? {
                 output.tick(false)?;
-                terminal.suspend()?;
+                terminal.suspend().map_err(|error| {
+                    std::io::Error::new(error.kind(), format!("suspend terminal: {error}"))
+                })?;
                 // SIGSTOP also works for orphaned groups and callers that
                 // inherited SIGTSTP ignored. Only Dot stops here; its shell
                 // and pipeline siblings keep their original job ownership.
@@ -89,7 +99,9 @@ fn supervise(
                     if received_signal().is_some() {
                         break;
                     }
-                    if terminal.resume()? {
+                    if terminal.resume().map_err(|error| {
+                        std::io::Error::new(error.kind(), format!("resume terminal: {error}"))
+                    })? {
                         job.signal(libc::SIGCONT)?;
                         break;
                     }
