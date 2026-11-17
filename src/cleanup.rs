@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 
 use crate::errors::{Error, Result};
 
+#[path = "foreground_job.rs"]
+mod foreground_job;
+
 /// TERM grace: 20 attempts × 50ms, mirroring
 /// `DOT_CLEANUP_GRACE_ATTEMPTS=20` and `sleep 0.05`.
 pub const GRACE_ATTEMPTS: u32 = 20;
@@ -3161,7 +3164,13 @@ pub(crate) fn exited(child: &Child) -> std::io::Result<bool> {
                 }
                 return Err(error);
             }
-            return Ok(info.si_pid() != 0);
+            // Filter the event as well as its identity: a stop or continuation
+            // must never authorize reaping a retained foreground job.
+            return Ok(info.si_pid() != 0
+                && matches!(
+                    info.si_code,
+                    libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                ));
         }
     }
 }
@@ -5177,6 +5186,23 @@ pub(crate) fn run_foreground_forward_stdout(command: Command, out: &mut dyn std:
     run_foreground_forward(command, Forwarded::Stdout, out)
 }
 
+/// Preserve terminal detection for caller-visible Git output without letting
+/// its descriptor writes overtake headers queued in the output relay. Git
+/// remains responsible for pager selection and color policy; redirected output
+/// keeps the ordinary capture transport, so scripts still receive raw bytes.
+pub(crate) fn run_foreground_forward_stdout_terminal(
+    command: Command,
+    out: &mut dyn std::io::Write,
+) -> i32 {
+    use std::io::IsTerminal as _;
+    if std::io::stdout().is_terminal() {
+        if let Some((master, slave)) = forward_terminal() {
+            return foreground_job::run(command, out, master, slave);
+        }
+    }
+    run_foreground_forward_stdout(command, out)
+}
+
 /// Run a cooperative foreground child like [`run_foreground_status`],
 /// but pipe its stderr and forward every drained chunk to `err`
 /// instead of inheriting the descriptor.
@@ -5203,7 +5229,7 @@ pub(crate) fn run_foreground_forward_stderr_terminal(
     command: Command,
     err: &mut dyn std::io::Write,
 ) -> i32 {
-    match stderr_terminal() {
+    match forward_terminal() {
         Some((master, slave)) => {
             run_foreground_forward_with(command, Forwarded::Stderr, err, master, slave)
         }
@@ -5211,46 +5237,17 @@ pub(crate) fn run_foreground_forward_stderr_terminal(
     }
 }
 
-/// Android: no private pseudo-terminal, so the fetch keeps the plain pipe.
-/// Bionic exports `openpty` only from API 23 and release builds target API
-/// 21, where linking it fails; a security-key notice that needs a terminal
-/// is rare enough on Termux not to warrant a second pseudo-terminal path.
-#[cfg(target_os = "android")]
-fn stderr_terminal() -> Option<(ForwardReader, Stdio)> {
-    None
-}
-
-/// Open the private pseudo-terminal behind
-/// [`run_foreground_forward_stderr_terminal`]: a nonblocking master and the
-/// slave for the child, both close-on-exec (the child gets the slave
-/// through its stderr redirection), output processing off, and the window
-/// size copied from stdout's terminal when it has one.
-#[cfg(not(target_os = "android"))]
-fn stderr_terminal() -> Option<(ForwardReader, Stdio)> {
+/// Open a private forwarding terminal with a nonblocking master, close-on-exec
+/// descriptors and output processing disabled. The real terminal still owns
+/// stdin and the foreground process group, so pagers and prompts read input
+/// normally while output remains ordered through the relay.
+fn forward_terminal() -> Option<(ForwardReader, Stdio)> {
     use std::os::fd::FromRawFd as _;
 
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
     // SAFETY: TIOCGWINSZ only fills the zeroed winsize it is handed.
     let sized = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ as _, &mut size) } == 0;
-    let (mut master, mut slave) = (-1, -1);
-    // SAFETY: openpty initializes both descriptors; the optional name and
-    // termios pointers are null, and the window size is a live local.
-    let opened = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            if sized {
-                &mut size
-            } else {
-                std::ptr::null_mut()
-            },
-        )
-    };
-    if opened != 0 {
-        return None;
-    }
+    let (master, slave) = terminal_pair()?;
     // Move both above the standard descriptors (one closed at entry must not
     // be reused) with close-on-exec set in the same step.
     let lift = |fd: i32| {
@@ -5287,8 +5284,58 @@ fn stderr_terminal() -> Option<(ForwardReader, Stdio)> {
                 attributes.c_oflag &= !libc::OPOST;
                 libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &attributes) == 0
             }
+            && (!sized || libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ as _, &size) == 0)
     };
     prepared.then(|| (ForwardReader::Terminal(master), Stdio::from(slave)))
+}
+
+/// Allocate through the API-21-compatible primitives on Linux and Android.
+/// Sharing that path exercises Termux's allocator in ordinary Linux tests;
+/// Bionic's `openpty` symbol would require API 23 at link time.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn terminal_pair() -> Option<(i32, i32)> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _};
+    // SAFETY: each successful descriptor is uniquely owned until transferred.
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+        if master < 0 {
+            return None;
+        }
+        let master = std::os::fd::OwnedFd::from_raw_fd(master);
+        let fd = master.as_raw_fd();
+        let mut name = [0 as libc::c_char; 128];
+        if libc::grantpt(fd) != 0
+            || libc::unlockpt(fd) != 0
+            || libc::ptsname_r(fd, name.as_mut_ptr(), name.len()) != 0
+        {
+            return None;
+        }
+        let slave = libc::open(
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        );
+        if slave < 0 {
+            return None;
+        }
+        Some((master.into_raw_fd(), slave))
+    }
+}
+
+/// BSD platforms provide `openpty` at the supported deployment targets.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn terminal_pair() -> Option<(i32, i32)> {
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty initializes both descriptors; optional pointers are null.
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (opened == 0).then_some((master, slave))
 }
 
 /// Which descriptor [`run_foreground_forward`] pipes.
@@ -5301,14 +5348,65 @@ enum Forwarded {
 enum ForwardReader {
     /// A private socket ([`SessionCapture`]).
     Socket(SessionCapture),
-    /// A pseudo-terminal master ([`stderr_terminal`]; never on Android).
-    #[cfg_attr(target_os = "android", allow(dead_code))]
+    /// A pseudo-terminal master ([`forward_terminal`]).
     Terminal(std::fs::File),
+}
+
+/// Keep the forwarding terminal aligned with the user's terminal. The pager
+/// belongs to the real foreground group, so its original SIGWINCH can arrive
+/// before our next drain tick updates its stdout's size. Notify that same
+/// foreground job again after a size change; unchanged sizes never signal.
+fn sync_terminal_size(master: &std::fs::File, group: Option<u32>) {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: both ioctls only access the live winsize locals. The master is
+    // owned by the reader; the real stdout descriptor is only inspected.
+    unsafe {
+        let mut source: libc::winsize = std::mem::zeroed();
+        let mut target: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ as _, &mut source) != 0
+            || libc::ioctl(master.as_raw_fd(), libc::TIOCGWINSZ as _, &mut target) != 0
+            || (
+                source.ws_row,
+                source.ws_col,
+                source.ws_xpixel,
+                source.ws_ypixel,
+            ) == (
+                target.ws_row,
+                target.ws_col,
+                target.ws_xpixel,
+                target.ws_ypixel,
+            )
+        {
+            return;
+        }
+        if libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ as _, &source) != 0 {
+            return;
+        }
+        if let Some(group) = group {
+            // The foreground-job owner retains this leader until its last
+            // drain, so this group cannot be reused during notification.
+            libc::kill(-(group as i32), libc::SIGWINCH);
+        } else if libc::tcgetpgrp(libc::STDOUT_FILENO) == libc::getpgrp() {
+            // This is the same foreground job the terminal resize targets,
+            // including Git's pager descendants. Never notify another job.
+            libc::kill(0, libc::SIGWINCH);
+        }
+    }
 }
 
 impl ForwardReader {
     /// Move up to `budget` available bytes into `output` without blocking.
     fn drain(&mut self, output: &mut Vec<u8>, budget: usize) -> std::io::Result<()> {
+        self.drain_for_group(output, budget, None)
+    }
+
+    /// Drain with optional authority over a retained foreground job's group.
+    fn drain_for_group(
+        &mut self,
+        output: &mut Vec<u8>,
+        budget: usize,
+        group: Option<u32>,
+    ) -> std::io::Result<()> {
         match self {
             ForwardReader::Socket(reader) => {
                 let mut remaining = usize::MAX;
@@ -5318,6 +5416,7 @@ impl ForwardReader {
             }
             ForwardReader::Terminal(master) => {
                 use std::io::Read as _;
+                sync_terminal_size(master, group);
                 let mut drained = 0;
                 let mut chunk = [0u8; 8192];
                 while drained < budget {
@@ -5707,7 +5806,17 @@ struct LaunchDecision<R> {
     signal: Option<i32>,
 }
 
-fn spawn_owned_child(mut command: Command) -> std::io::Result<OwnedLaunch<OwnedChild>> {
+fn spawn_owned_child(command: Command) -> std::io::Result<OwnedLaunch<OwnedChild>> {
+    spawn_owned_child_authorized(command, |_| Ok(()))
+}
+
+/// Run an optional parent-side handoff after retaining the child's identity
+/// and before authorizing exec. Foreground jobs use this barrier to transfer
+/// the controlling terminal without letting a fast pager read while background.
+fn spawn_owned_child_authorized(
+    mut command: Command,
+    authorize: impl FnOnce(u32) -> std::io::Result<()> + Send + 'static,
+) -> std::io::Result<OwnedLaunch<OwnedChild>> {
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
@@ -5801,6 +5910,7 @@ fn spawn_owned_child(mut command: Command) -> std::io::Result<OwnedLaunch<OwnedC
             let mut signal = received_signal();
             if signal.is_none() {
                 registration = Some(StatusChildRegistration::new(pid));
+                authorize(pid)?;
                 if let Some(observed) = received_signal() {
                     registration.take();
                     signal = Some(observed);
@@ -9372,6 +9482,53 @@ mod tests {
     /// inside `pid_t` are never allocated, so the sweep sees `ECHILD`.
     fn placeholder_pid(offset: u32) -> u32 {
         i32::MAX as u32 - offset
+    }
+
+    #[test]
+    fn exited_does_not_treat_a_stopped_child_as_terminal() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "kill -STOP $$; exit 7"])
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = OwnedChild::new(command.spawn().expect("spawn stopped child"));
+        let pid = child.child().id();
+        let stopped = poll_until(Instant::now() + Duration::from_secs(5), || {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: this registered child remains unreaped; WNOWAIT keeps
+            // the stop notification available to the exit probe under test.
+            let observed = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &mut info,
+                    libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if observed != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(
+                    (unsafe { info.si_pid() } == pid as i32 && info.si_code == libc::CLD_STOPPED)
+                        .then_some(()),
+                )
+            }
+        });
+        let premature = exited(child.child());
+        // Resume and reap before asserting: a failing regression must never
+        // strand its stopped child. OwnedChild also guards earlier unwinds.
+        signal_pid(pid, libc::SIGCONT);
+        let reaped = wait_child_until(child.child(), Instant::now() + Duration::from_secs(5));
+        if let Ok(status) = &reaped {
+            child.reaped = Some(*status);
+            child.disarm();
+        }
+        stopped.expect("observe child stop before probing exit");
+        assert!(!premature.expect("probe stopped child"));
+        assert_eq!(reaped.expect("reap continued child").code(), Some(7));
     }
 
     #[test]
