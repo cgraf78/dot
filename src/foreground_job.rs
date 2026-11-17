@@ -115,8 +115,17 @@ fn supervise(
         })();
         match observed {
             Ok(true) if received_signal().is_none() => {
+                // Keep abnormal restoration armed until the retained child is
+                // actually reaped. All output drains (and their resize group
+                // notifications) finished while its identity was still held.
+                terminal.release()?;
+                // The retained leader still pins this handoff's identity.
+                // After reap, cleanup may restore our own modes but must not
+                // address a foreground group by a now-reusable numeric ID.
+                terminal.group.store(0, Ordering::SeqCst);
+                let status = job.reap(false)?;
                 terminal.finish(false)?;
-                return job.reap(false).map(SessionEnd::Exited);
+                return Ok(SessionEnd::Exited(status));
             }
             Ok(_) => {}
             Err(error) => {

@@ -3164,7 +3164,13 @@ pub(crate) fn exited(child: &Child) -> std::io::Result<bool> {
                 }
                 return Err(error);
             }
-            return Ok(info.si_pid() != 0);
+            // Filter the event as well as its identity: a stop or continuation
+            // must never authorize reaping a retained foreground job.
+            return Ok(info.si_pid() != 0
+                && matches!(
+                    info.si_code,
+                    libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                ));
         }
     }
 }
@@ -9476,6 +9482,53 @@ mod tests {
     /// inside `pid_t` are never allocated, so the sweep sees `ECHILD`.
     fn placeholder_pid(offset: u32) -> u32 {
         i32::MAX as u32 - offset
+    }
+
+    #[test]
+    fn exited_does_not_treat_a_stopped_child_as_terminal() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "kill -STOP $$; exit 7"])
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = OwnedChild::new(command.spawn().expect("spawn stopped child"));
+        let pid = child.child().id();
+        let stopped = poll_until(Instant::now() + Duration::from_secs(5), || {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: this registered child remains unreaped; WNOWAIT keeps
+            // the stop notification available to the exit probe under test.
+            let observed = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &mut info,
+                    libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if observed != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(
+                    (unsafe { info.si_pid() } == pid as i32 && info.si_code == libc::CLD_STOPPED)
+                        .then_some(()),
+                )
+            }
+        });
+        let premature = exited(child.child());
+        // Resume and reap before asserting: a failing regression must never
+        // strand its stopped child. OwnedChild also guards earlier unwinds.
+        signal_pid(pid, libc::SIGCONT);
+        let reaped = wait_child_until(child.child(), Instant::now() + Duration::from_secs(5));
+        if let Ok(status) = &reaped {
+            child.reaped = Some(*status);
+            child.disarm();
+        }
+        stopped.expect("observe child stop before probing exit");
+        assert!(!premature.expect("probe stopped child"));
+        assert_eq!(reaped.expect("reap continued child").code(), Some(7));
     }
 
     #[test]

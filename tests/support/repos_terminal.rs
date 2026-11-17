@@ -20,6 +20,14 @@ fn repos_terminal(
             "-c",
             r#"
 import errno, fcntl, os, pty, re, select, signal, struct, subprocess, sys, termios, time
+def same_terminal(left, right):
+    left, right = list(left), list(right)
+    if sys.platform == 'darwin':
+        # XNU sets PENDIN when canonical mode is restored and preserves it
+        # through tcsetattr. Compare settings, not that transient input state.
+        left[3] &= ~termios.PENDIN
+        right[3] &= ~termios.PENDIN
+    return left == right
 pid, master = pty.fork()
 if pid == 0:
     # A persistent session owner reproduces an interactive shell: Dot's exit
@@ -54,16 +62,16 @@ if pid == 0:
                 termios.tcsetattr(0, termios.TCSANOW, shell)
                 os.kill(dot, signal.SIGCONT)
             else:
-                print('background-shell-preserved=' + str(termios.tcgetattr(0) == shell), flush=True)
+                print('background-shell-preserved=' + str(same_terminal(termios.tcgetattr(0), shell)), flush=True)
                 termios.tcsetattr(0, termios.TCSANOW, original)
                 os.tcsetpgrp(0, dot)
                 os.kill(dot, signal.SIGCONT)
     signal.signal(signal.SIGTTOU, signal.SIG_IGN)
     os.tcsetpgrp(0, os.getpgrp())
     restored = termios.tcgetattr(0)
-    if restored != original:
+    if not same_terminal(restored, original):
         print('terminal-diff=' + repr([(i, before, after) for i, (before, after) in enumerate(zip(original, restored)) if before != after]), flush=True)
-    print('terminal-restored=' + str(restored == original), flush=True)
+    print('terminal-restored=' + str(same_terminal(restored, original)), flush=True)
     code = os.waitstatus_to_exitcode(status)
     sys.exit(code if code >= 0 else 128 - code)
 output = bytearray()
