@@ -82,6 +82,12 @@ before replacing them (pass `--yes` to skip the prompt); replaced files go to
 `~/.dot-backup/`. Run `dot help` for every command and `dot init --help` for
 recovery options.
 
+`dot diff`, `dot status`, `dot fetch`, and `dot push` honor Git's pager and
+color settings for each repository. In a terminal, Git can launch your
+configured pager (such as Delta) and apply automatic colors. Redirecting or
+piping Dot's output preserves Git's normal non-interactive behavior. Pager
+environment overrides and per-command Git settings still take precedence.
+
 ## Runtime model
 
 The dot tool checkout is an ordinary repository. The selected client dotfiles

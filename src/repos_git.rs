@@ -9,7 +9,8 @@
 //! Engine boundaries: iteration records cross from shell globals as
 //! explicit parameters; header-prefixed commands forward piped git
 //! stdout through the caller's writer so relayed headers stay
-//! ordered ahead of it, while stderr stays inherited so progress
+//! ordered ahead of it, preserving a terminal for interactive output,
+//! while stderr stays inherited so progress
 //! reaches the terminal (unlike
 //! [`repos_base::run_git`](crate::repos_base::run_git), which pipes
 //! stdout and nulls stderr for inspection commands).
@@ -86,13 +87,15 @@ pub fn each_existing(
     0
 }
 
-/// Run `git` with `prefix` plus `args`, forwarding piped stdout to
+/// Run `git` with `prefix` plus `args`, forwarding stdout to
 /// `out` while stdin/stderr stay inherited.
 ///
 /// Stdout travels through the caller's writer instead of the
 /// inherited descriptor: a header
 /// printed through the output relay would otherwise race git's
 /// direct descriptor writes (body-before-header under load).
+/// Interactive stdout uses a private terminal so Git honors its own pager
+/// and automatic color settings; redirected stdout stays a plain stream.
 /// Progress keeps streaming on inherited stderr. Returns the exit
 /// code; a spawn failure returns 127.
 pub fn run_git_forwarded(prefix: &[OsString], args: &[&str], out: &mut dyn Write) -> i32 {
@@ -101,7 +104,7 @@ pub fn run_git_forwarded(prefix: &[OsString], args: &[&str], out: &mut dyn Write
         .args(args)
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit());
-    crate::cleanup::run_foreground_forward_stdout(cmd, out)
+    crate::cleanup::run_foreground_forward_stdout_terminal(cmd, out)
 }
 
 /// `_repo_git`: execute `git` for one repo record with stdout forwarded

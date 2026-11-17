@@ -109,6 +109,15 @@ Full command table (`lib/dot/commands.sh`, `lib/dot/main.sh`):
 | `init` | lock (except `--status/--help/-h`) + `dot_init_command` | 0/1/2 (unknown `--*`), 75, or 129/130/131/143 after HUP/INT/QUIT/TERM |
 | unknown | `dot: unknown command: %s` on stderr | 1 (2 if config unloadable — config load precedes dispatch) |
 
+The public `fetch`, `push`, `status`, and `diff` passthroughs preserve Git's
+terminal-dependent pager and color decisions while keeping each repository
+header ahead of its body. Interactive output uses a supervised forwarding
+terminal, including window-size updates. Git's job owns the real controlling
+terminal while interactive, with inherited stdin/stderr; Dot restores terminal
+ownership and settings after completion, cancellation, or job suspension.
+Redirected output uses the ordinary byte stream. Internal Git inspection calls
+remain non-interactive.
+
 Environment (precedence: process env wins; captured at load): `DOT_BASH`,
 `DOT_FORCE`/`SHDEPS_FORCE`, `DOT_QUIET`/`SHDEPS_QUIET`,
 `DOT_VERBOSE`/`SHDEPS_LOG_LEVEL=2`, `DOT_UPDATE_JOBS`, `DOT_MERGE_JOBS`,

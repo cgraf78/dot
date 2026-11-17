@@ -3530,6 +3530,9 @@ fn repos_run(client: &ReposClient, argv: &[&str]) -> std::process::Output {
     cmd.output().expect("run repository command")
 }
 
+#[path = "support/repos_terminal.rs"]
+mod repos_terminal;
+
 #[test]
 fn repos_status_clean_reports_both_repositories() {
     let client = stage_repos_client();

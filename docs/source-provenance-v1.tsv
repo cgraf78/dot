@@ -62,6 +62,7 @@ tests/perf_update.rs	standalone:new
 tests/support/perf_policy.rs	standalone:new
 tests/support/hook_runtime.rs	standalone:new
 tests/support/performance-supervisor-fixture.rs	standalone:new
+tests/support/repos_terminal.rs	standalone:new
 tests/platform.rs	standalone:new
 tests/profile_lifecycle.rs	standalone:new
 tests/profiles.rs	standalone:new
