@@ -293,24 +293,25 @@ fn repos_interactive_pager(client: &ReposClient, script: &str) {
     repos_dirty(client);
 }
 
-#[test]
-fn repos_terminal_pager_receives_updated_window_size() {
-    let client = stage_repos_client();
-    repos_interactive_pager(
-        &client,
-        r#"
+const RESIZE_PAGER: &str = r#"
 import os, signal, struct, sys, termios, fcntl
 def resized(signum, frame):
     rows, cols, _, _ = struct.unpack('HHHH', fcntl.ioctl(1, termios.TIOCGWINSZ, b'\0' * 8))
-    print(f'pager-size={rows}x{cols}', flush=True)
+    # No print() in a signal handler: a signal landing mid-print re-enters
+    # the buffered writer and raises RuntimeError. Write to the fd directly.
+    os.write(1, f'pager-size={rows}x{cols}\n'.encode())
     if (rows, cols) == (31, 101):
         sys.exit(0)
 signal.signal(signal.SIGWINCH, resized)
 print(f'pager-ready pid={os.getpid()} pager-pgid={os.getpgrp()}', flush=True)
 while True:
     signal.pause()
-"#,
-    );
+"#;
+
+#[test]
+fn repos_terminal_pager_receives_updated_window_size() {
+    let client = stage_repos_client();
+    repos_interactive_pager(&client, RESIZE_PAGER);
     let output = repos_terminal(&client, &["diff"], &[("DOT_TEST_PTY_ACTION", "resize")]);
     assert!(output.status.success(), "{output:?}");
     assert!(
@@ -326,9 +327,12 @@ original = termios.tcgetattr(fd)
 try:
     tty.setcbreak(fd)
     if os.environ.get('DOT_TEST_PTY_ACTION') == 'interrupt_then_input':
-        signal.signal(signal.SIGINT, lambda *_: print('pager-interrupted', flush=True))
+        # Signal handlers must not print(): a signal landing while the main
+        # thread is mid-print re-enters the buffered writer and raises
+        # RuntimeError, killing the pager. Write to the fd directly.
+        signal.signal(signal.SIGINT, lambda *_: os.write(1, b'pager-interrupted\n'))
     if os.environ.get('DOT_TEST_PTY_ACTION') in ('stop', 'stop_background'):
-        signal.signal(signal.SIGCONT, lambda *_: print('pager-resumed', flush=True))
+        signal.signal(signal.SIGCONT, lambda *_: os.write(1, b'pager-resumed\n'))
     if os.environ.get('DOT_TEST_PTY_ACTION') == 'terminate_stubborn':
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     print(f'pager-ready pid={os.getpid()} pager-pgid={os.getpgrp()}', flush=True)
@@ -338,6 +342,60 @@ finally:
     termios.tcsetattr(fd, termios.TCSANOW, original)
     os.close(fd)
 "#;
+
+/// A signal handler that calls `print()` can land while the main thread is
+/// mid-print and re-enter the buffered writer, raising `RuntimeError` and
+/// killing the pager (scheduled run 44268510873). Handlers must write to the
+/// fd directly. This static guard fails if a handler ever prints again: the
+/// race itself is microseconds wide and no behavioral test can hit it.
+#[test]
+fn repos_terminal_pager_signal_handlers_never_print() {
+    for (name, fixture) in [("INPUT_PAGER", INPUT_PAGER), ("RESIZE_PAGER", RESIZE_PAGER)] {
+        let lines: Vec<&str> = fixture.lines().collect();
+        for line in &lines {
+            let Some(signal) = line.find("signal.signal(") else {
+                continue;
+            };
+            if line.contains("lambda") {
+                assert!(
+                    !line.contains("print("),
+                    "{name}: signal handler must not print(): {line}"
+                );
+                continue;
+            }
+            // Named handler: `signal.signal(<sig>, <name>)` — the body of
+            // `def <name>(...):` is the handler.
+            let rest = &line[signal + "signal.signal(".len()..];
+            let Some(handler) = rest
+                .split(',')
+                .nth(1)
+                .map(str::trim)
+                .map(|h| h.trim_end_matches(')').trim())
+            else {
+                continue;
+            };
+            let def = format!("def {handler}(");
+            let Some(start) = lines
+                .iter()
+                .position(|candidate| candidate.trim_start().starts_with(&def))
+            else {
+                continue;
+            };
+            for body in &lines[start + 1..] {
+                if body.trim().is_empty() || body.trim_start().starts_with('#') {
+                    continue;
+                }
+                if !body.starts_with([' ', '\t']) {
+                    break;
+                }
+                assert!(
+                    !body.contains("print("),
+                    "{name}: signal handler `{handler}` must not print(): {body}"
+                );
+            }
+        }
+    }
+}
 
 #[test]
 fn repos_terminal_pager_can_read_the_real_controlling_terminal() {
