@@ -51,6 +51,183 @@ pub(crate) struct PreSyncOutcome {
     pub(crate) rc: i32,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+    /// Set when the worker's session could not be torn down cleanly; `rc`
+    /// is then nonzero whatever the hook itself returned.
+    pub(crate) cleanup: Option<IncompleteCleanup>,
+}
+
+impl PreSyncOutcome {
+    /// How the pre-sync coordinator sees this end.
+    pub(crate) fn ran(&self) -> crate::pre_sync::Ran {
+        match (&self.cleanup, self.rc) {
+            (Some(cleanup), _) => crate::pre_sync::Ran::CleanupIncomplete {
+                detail: cleanup.detail(),
+                exit: cleanup.exit(),
+            },
+            (None, 0) => crate::pre_sync::Ran::Succeeded,
+            (None, _) => crate::pre_sync::Ran::Failed,
+        }
+    }
+}
+
+/// One merge hook's end: the worker outcome plus, apart from it, whether
+/// teardown of its session could not finish.
+pub(crate) struct MergeOutcome {
+    pub(crate) rc: i32,
+    pub(crate) output: Vec<u8>,
+    /// Set when teardown could not finish; `rc` is then nonzero whatever
+    /// the hook itself returned.
+    pub(crate) cleanup: Option<IncompleteCleanup>,
+}
+
+/// A hook session whose teardown could not finish, kept apart from the
+/// hook's own failure: the hook may well have succeeded, and what needs
+/// fixing is whatever it left running.
+///
+/// The supervisor still fails the hook (strict cleanup is deliberate: a
+/// helper that outlives its hook can keep using the hook's descriptors),
+/// but the report says so instead of a bare "failed".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IncompleteCleanup {
+    /// The hook's own exit status (`128 + signal` for a signal death), when
+    /// the supervisor observed it.
+    exit: Option<i32>,
+    /// Processes still running in the hook's session that teardown could
+    /// not stop safely; empty when the supervisor could not tell which.
+    survivors: Vec<crate::cleanup::Survivor>,
+    /// Survivors past the supervisor's naming cap.
+    unnamed: usize,
+}
+
+/// Leading words of every [`IncompleteCleanup::detail`]. The detail is the
+/// whole `update.last-failure` item for a hook, so it must say on its own
+/// that cleanup, not the hook, failed.
+pub(crate) const CLEANUP_INCOMPLETE: &str = "cleanup incomplete";
+
+impl IncompleteCleanup {
+    /// A report as the supervisor would build it, for coordinator tests.
+    #[cfg(test)]
+    pub(crate) fn new(exit: Option<i32>, survivors: Vec<crate::cleanup::Survivor>) -> Self {
+        Self {
+            exit,
+            survivors,
+            unnamed: 0,
+        }
+    }
+
+    /// Teardown failed without saying which process it could not stop.
+    fn unexplained() -> Self {
+        Self {
+            exit: None,
+            survivors: Vec::new(),
+            unnamed: 0,
+        }
+    }
+
+    fn from_refusal(refusal: &crate::cleanup::UnpinnedSurvivors) -> Self {
+        Self {
+            exit: refusal.exit.map(status_code),
+            survivors: refusal.survivors.clone(),
+            unnamed: refusal.unnamed,
+        }
+    }
+
+    /// One line for warnings and `update.last-failure`, e.g. `cleanup
+    /// incomplete: the hook exited 0, but pid 4242 (helper, parent 1) was
+    /// left running in the hook's session`.
+    pub(crate) fn detail(&self) -> String {
+        let named = self.survivors.iter().map(|survivor| match &survivor.name {
+            Some(name) => format!("{} ({name}, parent {})", survivor.pid, survivor.parent),
+            None => format!("{} (parent {})", survivor.pid, survivor.parent),
+        });
+        let mut items = named.collect::<Vec<_>>();
+        if self.unnamed > 0 {
+            items.push(format!("{} more", self.unnamed));
+        }
+        let count = self.survivors.len() + self.unnamed;
+        if count == 0 {
+            return match self.exit {
+                Some(code) => format!(
+                    "{CLEANUP_INCOMPLETE}: the hook exited {code}, but dot could not confirm \
+                     that its processes stopped"
+                ),
+                None => {
+                    format!(
+                        "{CLEANUP_INCOMPLETE}: dot could not confirm that the hook's processes stopped"
+                    )
+                }
+            };
+        }
+        let (noun, verb) = if count == 1 {
+            ("pid", "was")
+        } else {
+            ("pids", "were")
+        };
+        let list = english_list(&items);
+        // "Left running" rather than "still running": teardown refused to
+        // signal them, so they keep running after this report.
+        match self.exit {
+            Some(0) => format!(
+                "{CLEANUP_INCOMPLETE}: the hook exited 0, but {noun} {list} {verb} left running \
+                 in the hook's session"
+            ),
+            Some(code) => format!(
+                "{CLEANUP_INCOMPLETE}: the hook exited {code}, and {noun} {list} {verb} left \
+                 running in the hook's session"
+            ),
+            None => format!(
+                "{CLEANUP_INCOMPLETE}: {noun} {list} {verb} left running in the hook's session"
+            ),
+        }
+    }
+
+    /// The hook's own exit status, when the supervisor observed it.
+    pub(crate) fn exit(&self) -> Option<i32> {
+        self.exit
+    }
+}
+
+/// Whether a worker failure note with `status` describes the end of a hook
+/// whose teardown could not finish, given its observed `exit`. The note is
+/// written by the hook's own ERR/EXIT traps, so it carries the status the
+/// hook ended with; with no observed status any note is this run's, since
+/// every worker gets a fresh scratch directory.
+pub(crate) fn note_describes_exit(exit: Option<i32>, status: i32) -> bool {
+    exit.is_none_or(|code| code == status)
+}
+
+/// Whether a hook whose teardown could not finish also failed on its own.
+/// `noted` says whether a note passed [`note_describes_exit`]: with no
+/// observed exit status, only a note proves the hook failed.
+///
+/// Such a hook reports its own failure first (`failed`, its note, its last
+/// line) and the teardown detail after; one that succeeded reports the
+/// teardown alone, since that is all that needs fixing.
+pub(crate) fn hook_failed(exit: Option<i32>, noted: bool) -> bool {
+    match exit {
+        Some(code) => code != 0,
+        None => noted,
+    }
+}
+
+/// `a`, `a and b`, or `a, b, and c`.
+fn english_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
+/// An exit status as the worker protocol's integer: the code, or `128 +
+/// signal` for a signal death.
+fn status_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
 }
 
 enum CommandFailure {
@@ -132,8 +309,15 @@ impl Worker {
         result: &Path,
         context: &Path,
         token: &str,
-    ) -> WorkerOutcome {
-        self.launch("merge", script, temporary, result, context, token)
+    ) -> MergeOutcome {
+        let ended = self.launch_abortable(
+            "merge", script, temporary, result, context, token, None, None,
+        );
+        MergeOutcome {
+            rc: ended.outcome.rc,
+            output: ended.outcome.output,
+            cleanup: ended.cleanup,
+        }
     }
 
     /// Run one doctor extension through the same sanitized, authenticated
@@ -160,7 +344,7 @@ impl Worker {
         abort: &AtomicBool,
         deadline: Option<std::time::Instant>,
     ) -> DoctorOutcome {
-        let (outcome, timed_out) = self.launch_abortable(
+        let ended = self.launch_abortable(
             "doctor",
             script,
             temporary,
@@ -171,9 +355,9 @@ impl Worker {
             deadline,
         );
         DoctorOutcome {
-            rc: outcome.rc,
-            output: outcome.output,
-            timed_out,
+            rc: ended.outcome.rc,
+            output: ended.outcome.output,
+            timed_out: ended.timed_out,
         }
     }
 
@@ -349,10 +533,10 @@ impl Worker {
             None,
             None,
         )
-        .0
+        .outcome
     }
 
-    /// Launch one worker; the flag reports a session stopped at `deadline`.
+    /// Launch one worker and supervise it to the end.
     #[allow(clippy::too_many_arguments)]
     fn launch_abortable(
         &self,
@@ -364,26 +548,12 @@ impl Worker {
         token: &str,
         abort: Option<&AtomicBool>,
         deadline: Option<std::time::Instant>,
-    ) -> (WorkerOutcome, bool) {
+    ) -> Ended {
         let command = match self.command(mode, script, result_dir, result_file, context, token) {
             Ok(command) => command,
-            Err(CommandFailure::Invalid) => {
-                return (
-                    WorkerOutcome {
-                        rc: 1,
-                        output: Vec::new(),
-                    },
-                    false,
-                );
-            }
+            Err(CommandFailure::Invalid) => return Ended::failed(Vec::new()),
             Err(CommandFailure::Bash(error)) => {
-                return (
-                    WorkerOutcome {
-                        rc: 1,
-                        output: self.runtime.bash_error_line_once(&error),
-                    },
-                    false,
-                );
+                return Ended::failed(self.runtime.bash_error_line_once(&error));
             }
         };
         let outcome = combined(command, result_dir, abort, deadline);
@@ -424,26 +594,47 @@ fn xdg_home(runtime: &Runtime, key: &str, fallback: &str) -> Option<PathBuf> {
     }
 }
 
+/// One supervised worker's end with combined output.
+struct Ended {
+    outcome: WorkerOutcome,
+    /// The session was stopped at its deadline.
+    timed_out: bool,
+    /// Teardown could not finish; `outcome.rc` is then nonzero.
+    cleanup: Option<IncompleteCleanup>,
+}
+
+impl Ended {
+    /// A worker that could not be launched at all.
+    fn failed(output: Vec<u8>) -> Self {
+        Self {
+            outcome: WorkerOutcome { rc: 1, output },
+            timed_out: false,
+            cleanup: None,
+        }
+    }
+}
+
+/// The worker exit code for a supervised end. Anything but a status fails
+/// the worker, an incomplete cleanup included: the hook's processes may
+/// still be running, so its result cannot count as converged.
+fn worker_rc(waited: &Waited) -> i32 {
+    match waited {
+        Waited::Status(rc) => *rc,
+        Waited::TimedOut | Waited::Failed | Waited::CleanupIncomplete(_) => 1,
+    }
+}
+
 /// Bash's `2>&1` gives both streams one open file description, so writes keep
 /// their observable order. A private scratch file gives `Command` the same
-/// property without racing independent stdout/stderr readers. The flag
-/// reports a session stopped at `deadline`; whatever it wrote before that
-/// is still returned.
+/// property without racing independent stdout/stderr readers. A session
+/// stopped at `deadline` still returns whatever it wrote before that.
 fn combined(
     mut command: Command,
     result_dir: &Path,
     abort: Option<&AtomicBool>,
     deadline: Option<std::time::Instant>,
-) -> (WorkerOutcome, bool) {
-    let failed = || {
-        (
-            WorkerOutcome {
-                rc: 1,
-                output: Vec::new(),
-            },
-            false,
-        )
-    };
+) -> Ended {
+    let failed = || Ended::failed(Vec::new());
     let path = result_dir.join("worker-output");
     let file = match OpenOptions::new()
         .read(true)
@@ -464,11 +655,13 @@ fn combined(
     let waited = wait_session(command, abort, deadline);
     let output = std::fs::read(&path).unwrap_or_default();
     let _ = std::fs::remove_file(path);
-    let rc = match waited {
-        Waited::Status(rc) => rc,
-        Waited::TimedOut | Waited::Failed => 1,
-    };
-    (WorkerOutcome { rc, output }, waited == Waited::TimedOut)
+    let rc = worker_rc(&waited);
+    let timed_out = matches!(waited, Waited::TimedOut);
+    Ended {
+        outcome: WorkerOutcome { rc, output },
+        timed_out,
+        cleanup: waited.into_cleanup(),
+    }
 }
 
 /// Allocate one private capture file under the worker's already-private
@@ -503,57 +696,73 @@ fn separate(mut command: Command, result_dir: &Path) -> PreSyncOutcome {
     command
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    let status = wait(command);
+    let waited = wait_session(command, None, None);
     let stdout = std::fs::read(&stdout_path).unwrap_or_default();
     let stderr = std::fs::read(&stderr_path).unwrap_or_default();
     let _ = std::fs::remove_file(stdout_path);
     let _ = std::fs::remove_file(stderr_path);
     PreSyncOutcome {
-        rc: status.unwrap_or(1),
+        rc: worker_rc(&waited),
         stdout,
         stderr,
+        cleanup: waited.into_cleanup(),
     }
 }
 
 /// Run one user hook in its own session and retain the leader until every
-/// descendant is gone. The CLI owns the signal handler; parallel hook threads
-/// only observe its atomic result and perform teardown for their own session.
+/// descendant is gone, reducing the end to the worker's exit code.
+#[cfg(test)]
 fn wait(command: Command) -> Option<i32> {
     wait_abortable(command, None)
 }
 
-/// [`wait`], additionally stopping the session once `abort` is set. The
-/// supervisor treats a failing tick as a delivery failure: it runs the same
-/// graceful TERM-then-KILL teardown and reports incomplete cleanup, which
-/// reads as a failed launch.
+/// [`wait`], additionally stopping the session once `abort` is set.
+#[cfg(test)]
 fn wait_abortable(command: Command, abort: Option<&AtomicBool>) -> Option<i32> {
     match wait_session(command, abort, None) {
         Waited::Status(rc) => Some(rc),
-        Waited::TimedOut | Waited::Failed => None,
+        Waited::TimedOut | Waited::Failed | Waited::CleanupIncomplete(_) => None,
     }
 }
 
 /// How a supervised worker session ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Waited {
     /// Exit status, or `128 + signal` for a signal death or interruption.
     Status(i32),
     /// The deadline passed; the session was stopped with the bounded
     /// TERM-then-KILL teardown.
     TimedOut,
-    /// The launch, an abort, or teardown failed.
+    /// The launch, an abort, or teardown failed in a way that is not an
+    /// incomplete cleanup (for example a signal-delivery error).
     Failed,
+    /// The worker ended, but teardown could not prove that every process
+    /// in its session stopped.
+    CleanupIncomplete(IncompleteCleanup),
+}
+
+impl Waited {
+    fn into_cleanup(self) -> Option<IncompleteCleanup> {
+        match self {
+            Waited::CleanupIncomplete(cleanup) => Some(cleanup),
+            Waited::Status(_) | Waited::TimedOut | Waited::Failed => None,
+        }
+    }
 }
 
 /// Supervise one worker session until it exits, `abort` is set, or
-/// `deadline` passes.
+/// `deadline` passes. The CLI owns the signal handler; parallel hook threads
+/// only observe its atomic result and perform teardown for their own session.
+///
+/// An abort is the caller's own cancellation: its error is untyped, so it
+/// stays a plain failure, and the supervisor gives a pending tick error
+/// precedence over an unpinned-survivor refusal. Only the doctor passes
+/// `abort`, and its outcome carries no teardown report.
 fn wait_session(
     command: Command,
     abort: Option<&AtomicBool>,
     deadline: Option<std::time::Instant>,
 ) -> Waited {
-    use std::os::unix::process::ExitStatusExt as _;
-
     let tick = |_| match abort {
         Some(abort) if abort.load(Ordering::SeqCst) => {
             Err(std::io::Error::other("doctor extension aborted"))
@@ -561,14 +770,16 @@ fn wait_session(
         _ => Ok(()),
     };
     match crate::cleanup::supervise_session(command, deadline, tick) {
-        Ok(crate::cleanup::SessionEnd::Exited(status)) => Waited::Status(
-            status
-                .code()
-                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
-        ),
+        Ok(crate::cleanup::SessionEnd::Exited(status)) => Waited::Status(status_code(status)),
         Ok(crate::cleanup::SessionEnd::Interrupted(signal)) => Waited::Status(128 + signal),
         Ok(crate::cleanup::SessionEnd::TimedOut) => Waited::TimedOut,
-        Ok(crate::cleanup::SessionEnd::CleanupIncomplete) | Err(_) => Waited::Failed,
+        Ok(crate::cleanup::SessionEnd::CleanupIncomplete) => {
+            Waited::CleanupIncomplete(IncompleteCleanup::unexplained())
+        }
+        Err(error) => match crate::cleanup::unpinned_survivors(&error) {
+            Some(refusal) => Waited::CleanupIncomplete(IncompleteCleanup::from_refusal(refusal)),
+            None => Waited::Failed,
+        },
     }
 }
 
@@ -577,6 +788,7 @@ fn failed_pre_sync(stderr: Vec<u8>) -> PreSyncOutcome {
         rc: 1,
         stdout: Vec::new(),
         stderr,
+        cleanup: None,
     }
 }
 
@@ -953,7 +1165,10 @@ mod tests {
         command
             .args([
                 "-c",
-                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; sleep 3) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
+                // `exec` keeps the escaped member one process: a Bash that
+                // forks a subshell's last command would add a second
+                // unpinned survivor.
+                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; exec sleep 3) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
                 "hook-descendant",
             ])
             .arg(&marker)
@@ -961,7 +1176,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let started = std::time::Instant::now();
-        let status = wait(command);
+        let waited = super::wait_session(command, None, None);
         let pid = std::fs::read_to_string(&marker)
             .expect("descendant marker")
             .trim()
@@ -972,12 +1187,212 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        assert_eq!(status, None, "unsafe cleanup was reported as success");
+        // The hook itself succeeded; the report says so and names the
+        // descendant it left behind instead of a bare failure.
+        let super::Waited::CleanupIncomplete(cleanup) = &waited else {
+            panic!("unsafe cleanup was not reported as incomplete: {waited:?}");
+        };
+        assert_eq!(
+            super::worker_rc(&waited),
+            1,
+            "incomplete cleanup read as success"
+        );
+        assert_eq!(cleanup.exit, Some(0));
+        assert_eq!(
+            cleanup
+                .survivors
+                .iter()
+                .map(|survivor| survivor.pid)
+                .collect::<Vec<_>>(),
+            [pid as u32]
+        );
+        let detail = cleanup.detail();
+        assert!(
+            detail.starts_with("cleanup incomplete: the hook exited 0, but pid "),
+            "{detail}"
+        );
+        assert!(detail.contains(&format!("pid {pid} (")), "{detail}");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(6),
             "incomplete cleanup was not bounded"
         );
         assert!(!process_live(pid), "self-bounded descendant survived");
+    }
+
+    fn survivor(pid: u32, name: Option<&str>) -> crate::cleanup::Survivor {
+        crate::cleanup::Survivor {
+            pid,
+            parent: 1,
+            name: name.map(str::to_string),
+        }
+    }
+
+    fn cleanup(
+        exit: Option<i32>,
+        survivors: Vec<crate::cleanup::Survivor>,
+        unnamed: usize,
+    ) -> String {
+        super::IncompleteCleanup {
+            exit,
+            survivors,
+            unnamed,
+        }
+        .detail()
+    }
+
+    #[test]
+    fn incomplete_cleanup_detail_names_what_outlived_the_hook() {
+        assert_eq!(
+            cleanup(Some(0), vec![survivor(42, Some("helper"))], 0),
+            "cleanup incomplete: the hook exited 0, but pid 42 (helper, parent 1) was left \
+             running in the hook's session"
+        );
+        // A name the kernel no longer had leaves the PID and parent.
+        assert_eq!(
+            cleanup(Some(0), vec![survivor(42, None)], 0),
+            "cleanup incomplete: the hook exited 0, but pid 42 (parent 1) was left running in \
+             the hook's session"
+        );
+        // A failing hook says so too: both need fixing.
+        assert_eq!(
+            cleanup(Some(3), vec![survivor(42, Some("helper"))], 0),
+            "cleanup incomplete: the hook exited 3, and pid 42 (helper, parent 1) was left \
+             running in the hook's session"
+        );
+        assert_eq!(
+            cleanup(None, vec![survivor(42, Some("helper"))], 0),
+            "cleanup incomplete: pid 42 (helper, parent 1) was left running in the hook's \
+             session"
+        );
+    }
+
+    #[test]
+    fn pre_sync_outcomes_map_to_the_coordinators_view() {
+        let outcome = |rc, cleanup| super::PreSyncOutcome {
+            rc,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            cleanup,
+        };
+        assert_eq!(outcome(0, None).ran(), crate::pre_sync::Ran::Succeeded);
+        assert_eq!(outcome(3, None).ran(), crate::pre_sync::Ran::Failed);
+        // A teardown report wins over the forced worker status, and carries
+        // the hook's own exit for note matching.
+        let report = super::IncompleteCleanup::new(Some(3), vec![survivor(42, Some("helper"))]);
+        assert_eq!(
+            outcome(1, Some(report.clone())).ran(),
+            crate::pre_sync::Ran::CleanupIncomplete {
+                detail: report.detail(),
+                exit: Some(3),
+            }
+        );
+    }
+
+    #[test]
+    fn a_hook_with_an_incomplete_teardown_failed_only_on_proof() {
+        // An observed exit decides; without one only a note proves failure.
+        assert!(!super::hook_failed(Some(0), true));
+        assert!(super::hook_failed(Some(3), false));
+        assert!(super::hook_failed(None, true));
+        assert!(!super::hook_failed(None, false));
+        // A note describes the hook's end only for its own status.
+        assert!(super::note_describes_exit(Some(3), 3));
+        assert!(!super::note_describes_exit(Some(3), 5));
+        assert!(super::note_describes_exit(None, 5));
+    }
+
+    #[test]
+    fn incomplete_cleanup_detail_lists_several_survivors() {
+        assert_eq!(
+            cleanup(
+                Some(0),
+                vec![survivor(42, Some("a")), survivor(43, None)],
+                0
+            ),
+            "cleanup incomplete: the hook exited 0, but pids 42 (a, parent 1) and 43 (parent 1) \
+             were left running in the hook's session"
+        );
+        assert_eq!(
+            cleanup(
+                Some(0),
+                vec![survivor(42, Some("a")), survivor(43, Some("b"))],
+                2
+            ),
+            "cleanup incomplete: the hook exited 0, but pids 42 (a, parent 1), 43 (b, parent 1), \
+             and 2 more were left running in the hook's session"
+        );
+    }
+
+    #[test]
+    fn incomplete_cleanup_detail_without_survivors_stays_honest() {
+        assert_eq!(
+            cleanup(None, Vec::new(), 0),
+            "cleanup incomplete: dot could not confirm that the hook's processes stopped"
+        );
+        assert_eq!(
+            cleanup(Some(0), Vec::new(), 0),
+            "cleanup incomplete: the hook exited 0, but dot could not confirm that its \
+             processes stopped"
+        );
+    }
+
+    #[test]
+    fn only_incomplete_cleanup_carries_a_report() {
+        let incomplete = super::Waited::CleanupIncomplete(super::IncompleteCleanup::unexplained());
+        assert_eq!(super::worker_rc(&incomplete), 1);
+        assert!(incomplete.into_cleanup().is_some());
+        for waited in [
+            super::Waited::Status(0),
+            super::Waited::Status(7),
+            super::Waited::TimedOut,
+            super::Waited::Failed,
+        ] {
+            assert!(waited.into_cleanup().is_none());
+        }
+        assert_eq!(super::worker_rc(&super::Waited::Status(7)), 7);
+    }
+
+    #[test]
+    fn aborted_worker_is_a_failure_not_a_teardown_report() {
+        // An abort is the caller's own cancellation, an untyped error that
+        // must stay a plain failure rather than read as a teardown report.
+        let abort = std::sync::atomic::AtomicBool::new(true);
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let waited = super::wait_session(command, Some(&abort), None);
+        assert_eq!(waited, super::Waited::Failed);
+    }
+
+    #[test]
+    fn statuses_and_signal_deaths_map_like_the_worker_protocol() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        assert_eq!(
+            super::status_code(std::process::ExitStatus::from_raw(3 << 8)),
+            3
+        );
+        assert_eq!(
+            super::status_code(std::process::ExitStatus::from_raw(libc::SIGKILL)),
+            128 + libc::SIGKILL
+        );
+    }
+
+    #[test]
+    fn english_lists_join_like_prose() {
+        let items = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(super::english_list(&items(&[])), "");
+        assert_eq!(super::english_list(&items(&["a"])), "a");
+        assert_eq!(super::english_list(&items(&["a", "b"])), "a and b");
+        assert_eq!(super::english_list(&items(&["a", "b", "c"])), "a, b, and c");
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

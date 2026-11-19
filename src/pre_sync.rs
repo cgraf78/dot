@@ -244,9 +244,36 @@ pub struct Call {
     pub token: String,
 }
 
-/// Worker spawn injected by the caller: `true` is worker exit 0,
-/// any worker failure (any nonzero exit) is `false`.
-pub type Runner<'a> = dyn FnMut(&Call) -> bool + 'a;
+/// How one injected worker spawn ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ran {
+    /// Worker exit 0.
+    Succeeded,
+    /// Any worker failure (any nonzero exit).
+    Failed,
+    /// The worker's session could not be torn down, whatever the hook
+    /// itself returned.
+    CleanupIncomplete {
+        /// One line saying what was left running, rendered under the
+        /// warning.
+        detail: String,
+        /// The hook's own exit status, when the supervisor observed it.
+        exit: Option<i32>,
+    },
+}
+
+/// Worker spawn injected by the caller.
+pub type Runner<'a> = dyn FnMut(&Call) -> Ran + 'a;
+
+/// The extension that stopped a run, for the `update.last-failure` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// Entry-point basename, as the warning names it.
+    pub name: String,
+    /// The worker's failure note, else its teardown detail; empty when it
+    /// left neither (the name alone then says which extension failed).
+    pub detail: String,
+}
 
 /// Outcome of [`run`]: the shell exit status plus the warning
 /// texts the shell hands to `_warn` (rendered by the caller;
@@ -257,8 +284,12 @@ pub struct Outcome {
     pub status: i32,
     /// `  warning: pre-sync extension failed: {name}` per failure, followed
     /// by `    exited with status N at <file>:<line>: <command>` when the
-    /// worker left a failure note.
+    /// worker left a failure note. A hook that succeeded but whose teardown
+    /// could not finish reads `cleanup incomplete` in place of `failed`;
+    /// either way the teardown detail follows as a last line.
     pub warnings: Vec<String>,
+    /// The extension that stopped the run, when one did.
+    pub failure: Option<Failure>,
 }
 
 /// Allocate a `mktemp -d`-style scratch directory under `root`
@@ -335,10 +366,12 @@ pub fn run(
         return Ok(Outcome {
             status: 0,
             warnings: Vec::new(),
+            failure: None,
         });
     }
     let mut warnings = Vec::new();
     let mut status = 0;
+    let mut failure = None;
     for spec in &found {
         let temporary = mktemp_dir(scratch_root)?;
         let result = temporary.join("result");
@@ -373,24 +406,53 @@ pub fn run(
             context,
             token,
         };
-        if !runner(&call) {
-            // One stopped by Ctrl-C did not fail on its own.
+        let ran = runner(&call);
+        if ran != Ran::Succeeded {
+            let name = basename(&spec.script);
             let interrupted = crate::cleanup::received_signal().is_some();
-            let outcome = if interrupted { "interrupted" } else { "failed" };
-            warnings.push(format!(
-                "  warning: pre-sync extension {outcome}: {}",
-                basename(&spec.script)
-            ));
             // A failing hook often prints nothing (a bare `|| return 1`), so
             // the worker's note is the only clue to which line stopped it.
             // The scratch directory is fresh per call, so any note is this
             // call's own. A hook stopped by Ctrl-C did not fail on a line.
-            let note = (!interrupted)
-                .then(|| crate::doctor_orchestrator::FailureNote::read(&call.result))
-                .flatten();
-            if let Some(note) = note {
-                warnings.push(format!("    {}", String::from_utf8_lossy(&note.detail())));
+            // With an incomplete teardown the worker status is forced
+            // nonzero, so the note must match the hook's own exit instead.
+            let read_note = || {
+                (!interrupted)
+                    .then(|| crate::doctor_orchestrator::FailureNote::read(&call.result))
+                    .flatten()
+            };
+            let (note, teardown) = match ran {
+                Ran::CleanupIncomplete { detail, exit } => {
+                    let note = read_note().filter(|note| {
+                        note.status != 0
+                            && crate::hook_worker::note_describes_exit(exit, note.status)
+                    });
+                    let hook_failed = crate::hook_worker::hook_failed(exit, note.is_some());
+                    (note, Some((detail, hook_failed)))
+                }
+                Ran::Succeeded | Ran::Failed => (read_note(), None),
+            };
+            // One stopped by Ctrl-C did not fail on its own, and one that
+            // only left a process running did not fail at all.
+            let outcome = match &teardown {
+                _ if interrupted => "interrupted",
+                Some((_, false)) => crate::hook_worker::CLEANUP_INCOMPLETE,
+                Some((_, true)) | None => "failed",
+            };
+            warnings.push(format!("  warning: pre-sync extension {outcome}: {name}"));
+            let note = note.map(|note| String::from_utf8_lossy(&note.detail()).into_owned());
+            if let Some(note) = &note {
+                warnings.push(format!("    {note}"));
             }
+            if let Some((detail, _)) = &teardown {
+                warnings.push(format!("    {detail}"));
+            }
+            // The hook's own line names its failure best; a teardown detail
+            // explains a hook that left no note.
+            let detail = note
+                .or(teardown.map(|(detail, _)| detail))
+                .unwrap_or_default();
+            failure = Some(Failure { name, detail });
             let _ = std::fs::remove_dir_all(&temporary);
             status = 1;
             break;
@@ -399,5 +461,9 @@ pub fn run(
             return Err(Error::Refused);
         }
     }
-    Ok(Outcome { status, warnings })
+    Ok(Outcome {
+        status,
+        warnings,
+        failure,
+    })
 }

@@ -57,6 +57,27 @@ extension as a line under its warning, and a failed doctor extension in its
 row. A merge hook that printed nothing, or only its title, also records the
 note as its failure detail.
 
+Each worker runs in its own session, and Dot stops everything left in it
+once the entry point returns. A process that outlives the hook outside its
+process group, such as a fire-and-forget telemetry or logging helper that a
+tool the hook ran left behind, cannot be stopped safely on platforms without
+pidfds (macOS), so Dot leaves it running and fails the hook even when the
+entry point returned 0. For merge hooks and pre-sync extensions, a hook that
+otherwise succeeded then reads `cleanup incomplete` instead of `failed`
+(`warning: merge cleanup incomplete`, `warning: pre-sync extension cleanup
+incomplete: <name>`), followed by a detail line such as `cleanup incomplete:
+the hook exited 0, but pid 4242 (helper, parent 1) was left running in the
+hook's session`, which is also the run's recorded failure detail. A hook that
+also failed on its own still reads `failed` and keeps its failure note, with
+the teardown detail after it. On any platform, the same wording also appears
+when teardown cannot prove that every process stopped (`dot could not
+confirm that the hook's processes stopped`), and that run exits 125; on
+Linux and Android, where an escaped process can be stopped, that is the only
+case. Doctor extensions and deactivation hooks
+still report a plain failure. The fix is to make the lingering tool exit
+with the hook (most such helpers have an opt-out) rather than to change the
+hook.
+
 Only the entry point carries the trace attribute (`declare -ft`), not every
 function (`set -T`), so a `trap ... RETURN` that a hook sets inside a helper
 fires only on returns from that helper and the entry point, never on returns
