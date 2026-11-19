@@ -147,7 +147,7 @@ fn drive(
     let mut runner = |call: &pre_sync::Call| {
         seen += 1;
         if Some(seen) == fail_at {
-            return false;
+            return pre_sync::Ran::Failed;
         }
         assert!(call.temporary.is_dir());
         assert_eq!(
@@ -174,7 +174,7 @@ fn drive(
             decoded.stage,
             decoded.records.join(" ")
         ));
-        true
+        pre_sync::Ran::Succeeded
     };
     let outcome = pre_sync::run(
         stage,
@@ -213,7 +213,8 @@ fn run_stage_and_empty_agree() {
             drive(dir.path(), &ext, stage, &[], None).0,
             Ok(pre_sync::Outcome {
                 status: 0,
-                warnings: vec![]
+                warnings: vec![],
+                failure: None,
             })
         );
     }
@@ -237,6 +238,14 @@ fn run_orchestration_agrees() {
         failed.warnings,
         vec!["  warning: pre-sync extension failed: 20-b.sh"]
     );
+    // With no note to go on, the recorded cause still names the extension.
+    assert_eq!(
+        failed.failure,
+        Some(pre_sync::Failure {
+            name: "20-b.sh".into(),
+            detail: "pre-sync extension failed".into(),
+        })
+    );
 }
 
 #[test]
@@ -248,14 +257,14 @@ fn failure_note_follows_the_warning() {
     std::fs::create_dir_all(&scratch).expect("scratch");
     let mut runner = |call: &pre_sync::Call| {
         if call.key.starts_with("10-a") {
-            return true;
+            return pre_sync::Ran::Succeeded;
         }
         std::fs::write(
             dot::doctor_orchestrator::failure_path(&call.result),
             b"7\0run\0pre-sync.d/20-b.sh:4\0return 7",
         )
         .expect("note");
-        false
+        pre_sync::Ran::Failed
     };
     let outcome = pre_sync::run(
         "prepare",
@@ -273,6 +282,63 @@ fn failure_note_follows_the_warning() {
             "  warning: pre-sync extension failed: 20-b.sh",
             "    exited with status 7 at pre-sync.d/20-b.sh:4: return 7",
         ]
+    );
+    assert_eq!(
+        outcome.failure.map(|failure| failure.detail),
+        Some("exited with status 7 at pre-sync.d/20-b.sh:4: return 7".into())
+    );
+    assert_eq!(
+        std::fs::read_dir(&scratch).expect("scratch list").count(),
+        0
+    );
+}
+
+#[test]
+fn incomplete_cleanup_is_reported_apart_from_a_failure() {
+    // A worker whose teardown could not finish gets its own warning word and
+    // its detail, never a stale failure note, and stops the run like any
+    // failure.
+    let (dir, ext) = fixture("presync-cleanup-native", &["10-a.sh", "20-b.sh"]);
+    let scratch = dir.path().join("scratch");
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    let detail = "cleanup incomplete: the hook exited 0, but pid 42 (helper, parent 1) was \
+                  still running in its session";
+    let mut calls = 0;
+    let mut runner = |call: &pre_sync::Call| {
+        calls += 1;
+        std::fs::write(
+            dot::doctor_orchestrator::failure_path(&call.result),
+            b"7\0run\0pre-sync.d/10-a.sh:4\0return 7",
+        )
+        .expect("note");
+        pre_sync::Ran::CleanupIncomplete {
+            detail: detail.to_string(),
+        }
+    };
+    let outcome = pre_sync::run(
+        "prepare",
+        &[],
+        &inputs(dir.path(), &ext),
+        &[],
+        &scratch,
+        &mut runner,
+    )
+    .expect("outcome");
+    assert_eq!(calls, 1);
+    assert_eq!(outcome.status, 1);
+    assert_eq!(
+        outcome.warnings,
+        vec![
+            "  warning: pre-sync extension cleanup incomplete: 10-a.sh".to_string(),
+            format!("    {detail}"),
+        ]
+    );
+    assert_eq!(
+        outcome.failure,
+        Some(pre_sync::Failure {
+            name: "10-a.sh".into(),
+            detail: detail.into(),
+        })
     );
     assert_eq!(
         std::fs::read_dir(&scratch).expect("scratch list").count(),

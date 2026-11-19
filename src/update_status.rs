@@ -46,8 +46,9 @@
 //!   a record a later run (or an older Dot that does not write it) has
 //!   superseded never explains the wrong run. Then one line per failing
 //!   item, `item<TAB><stage><TAB><name><TAB><detail>` (a failed Shdeps
-//!   item, a merge-hook key, a repository, a dirty file, or the stage's
-//!   own reason), at most [`MAX_FAILURE_ITEMS_PER_STAGE`] per stage, and
+//!   item, a merge-hook key, a pre-sync extension, a repository, a dirty
+//!   file, or the stage's own reason), at most
+//!   [`MAX_FAILURE_ITEMS_PER_STAGE`] per stage, and
 //!   `more<TAB><stage><TAB><count>` for the rest. Fields are
 //!   credential-redacted (URL userinfo becomes `***`), control-sanitized,
 //!   and capped, and the whole body stays within

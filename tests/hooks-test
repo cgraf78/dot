@@ -135,6 +135,10 @@ set -e
 assert_eq 1 "$pre_sync_status" 'failed pre-sync extension aborts update'
 assert_contains $'  warning: pre-sync extension failed: 10-failing.sh\n    exited with status 7 at pre-sync.d/10-failing.sh:4: return 7' \
   "$pre_sync_output" 'pre-sync failure names the return line that stopped it'
+# The recorded cause names the extension and its note, not just the stage.
+assert_contains $'item\trepos\tpre-sync 10-failing.sh\texited with status 7 at pre-sync.d/10-failing.sh:4: return 7' \
+  "$(<"$state/dot/update.last-failure")" \
+  'pre-sync failure records the extension and the line that stopped it'
 assert_eq failing "$(<"$home/pre-sync.log")" \
   'pre-sync failure stops later preparation extensions'
 [[ $head_before != "$(git --git-dir="$home/.dotfiles" rev-parse HEAD)" ]] ||

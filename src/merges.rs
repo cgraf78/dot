@@ -649,8 +649,12 @@ struct ResultRecord {
     rc: i32,
     output: Vec<u8>,
     /// The worker's failure note as one detail line (`exited with status N
-    /// at <file>:<line>: <command>`), for a failed hook that left one.
+    /// at <file>:<line>: <command>`), for a failed hook that left one, or
+    /// the incomplete-cleanup detail when `cleanup_incomplete` is set.
     note: Option<Vec<u8>>,
+    /// The hook's session could not be torn down: the note says what was
+    /// left running, and that, not the hook's output, is the failure.
+    cleanup_incomplete: bool,
     has_merge: bool,
     elapsed_ms: i64,
 }
@@ -677,6 +681,11 @@ impl ResultRecord {
     /// in for a hook that printed nothing but its opening title (`Git`),
     /// which names the hook rather than the cause.
     fn failure_detail(&self) -> String {
+        if let (true, Some(note)) = (self.cleanup_incomplete, &self.note) {
+            // The hook's own last line describes a run that may well have
+            // succeeded; what failed is the teardown the note explains.
+            return crate::update_status::last_line(note);
+        }
         let own = crate::update_status::last_line(&self.output);
         let Some(note) = &self.note else {
             return own;
@@ -720,6 +729,7 @@ fn run_one(
             rc: 1,
             output: b"dot: cannot create private merge-hook TMPDIR\n".to_vec(),
             note: None,
+            cleanup_incomplete: false,
             has_merge: false,
             elapsed_ms: 0,
         };
@@ -738,7 +748,7 @@ fn run_one(
         inputs.extension_inputs.euid,
     );
     let started = Instant::now();
-    let (rc, output) = match created {
+    let (rc, output, cleanup) = match created {
         Ok((context, token)) => {
             let mut worker = crate::hook_worker::Worker::for_update(
                 inputs.runtime,
@@ -752,26 +762,33 @@ fn run_one(
                 },
             );
             let outcome = worker.merge(&hook.script, &temporary, &result, &context, &token);
-            (outcome.rc, outcome.output)
+            (outcome.rc, outcome.output, outcome.cleanup)
         }
-        Err(_) => (1, Vec::new()),
+        Err(_) => (1, Vec::new(), None),
     };
     let has_merge = std::fs::read_to_string(&result)
         .ok()
         .is_some_and(|value| value.trim() == "1");
-    // A note whose status differs from the exit status is about some other
-    // failure the hook survived, so it would blame the wrong line.
-    let note = (rc != 0)
-        .then(|| crate::doctor_orchestrator::FailureNote::read(&result))
-        .flatten()
-        .filter(|note| note.status == rc)
-        .map(|note| note.detail());
+    let note = match &cleanup {
+        // The teardown detail already carries the hook's own exit status,
+        // and a worker note could only describe a status other than the
+        // one the hook ended with.
+        Some(cleanup) => Some(cleanup.detail().into_bytes()),
+        // A note whose status differs from the exit status is about some
+        // other failure the hook survived, so it would blame the wrong line.
+        None => (rc != 0)
+            .then(|| crate::doctor_orchestrator::FailureNote::read(&result))
+            .flatten()
+            .filter(|note| note.status == rc)
+            .map(|note| note.detail()),
+    };
     let _ = std::fs::remove_dir_all(&temporary);
     ResultRecord {
         hook,
         rc,
         output,
         note,
+        cleanup_incomplete: cleanup.is_some(),
         has_merge,
         elapsed_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
     }
@@ -811,6 +828,7 @@ fn wait_for_worker(
                     rc: 1,
                     output: Vec::new(),
                     note: None,
+                    cleanup_incomplete: false,
                     has_merge: false,
                     elapsed_ms: 0,
                 };
@@ -957,9 +975,12 @@ fn replay(
             );
             let _ = out.write_all(&rendered);
         } else if record.rc != 0 {
-            // A hook stopped by Ctrl-C did not fail on its own.
+            // A hook stopped by Ctrl-C did not fail on its own, and one
+            // whose teardown could not finish may not have failed at all.
             let outcome = if crate::cleanup::received_signal().is_some() {
                 "interrupted"
+            } else if record.cleanup_incomplete {
+                crate::hook_worker::CLEANUP_INCOMPLETE
             } else {
                 "failed"
             };
@@ -1297,6 +1318,7 @@ mod tests {
             rc: 0,
             output: output.to_vec(),
             note: None,
+            cleanup_incomplete: false,
             has_merge: true,
             elapsed_ms: 7,
         };
@@ -1372,6 +1394,7 @@ mod tests {
             rc: 1,
             output: output.to_vec(),
             note: Some(note.to_vec()),
+            cleanup_incomplete: false,
             has_merge: true,
             elapsed_ms: 7,
         };
@@ -1432,6 +1455,96 @@ mod tests {
                     "30-sapling".to_string(),
                     "exited with status 1 at merge-hooks.d/30-sapling.sh:5: return 1".to_string()
                 ),
+            ]
+        );
+    }
+
+    #[test]
+    fn incomplete_cleanup_is_reported_apart_from_a_failed_merge() {
+        // A hook that succeeded but left a helper in its session is a
+        // distinct outcome: its own row word, and a recorded detail that
+        // names the teardown, never the hook's last (successful) line.
+        let scope = TempDir::new("merge-cleanup-incomplete").expect("fixture");
+        let env = BTreeMap::from([
+            (OsString::from("HOME"), scope.path().as_os_str().to_owned()),
+            (
+                OsString::from("DOT_SOURCE_ROOT"),
+                OsString::from(env!("CARGO_MANIFEST_DIR")),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, scope.path()).expect("runtime");
+        let palette = crate::progress_ui::Palette::empty();
+        let log = crate::log::Log::new(false, false);
+        let inputs = RunInputs {
+            runtime: &runtime,
+            update_lock_token: None,
+            extension_inputs: crate::extension_trust::Inputs {
+                euid: 0,
+                home: String::new(),
+                extensions_dir: String::new(),
+                manifest: String::new(),
+            },
+            extensions_enabled: true,
+            overlays: &[],
+            tmp: scope.path(),
+            update_jobs: None,
+            merge_jobs: None,
+            verbose: false,
+            quiet: false,
+            force: false,
+            palette: &palette,
+            multibyte: false,
+            ascii: true,
+            ui_total: Some("1"),
+            bar_width: "8",
+            log: &log,
+        };
+        let detail = "cleanup incomplete: the hook exited 0, but pid 42 (helper, parent 1) \
+                      was still running in its session";
+        let incomplete = |key: &str, output: &[u8]| ResultRecord {
+            hook: Hook {
+                key: OsString::from(key),
+                script: std::path::PathBuf::from(format!("{key}.sh")),
+            },
+            rc: 1,
+            output: output.to_vec(),
+            note: Some(detail.as_bytes().to_vec()),
+            cleanup_incomplete: true,
+            has_merge: true,
+            elapsed_ms: 7,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut failures = Vec::new();
+        let counts = super::replay(
+            vec![
+                incomplete("10-git", b""),
+                incomplete("20-ignore", b"wrote ignore\n"),
+            ],
+            &inputs,
+            &mut out,
+            &mut err,
+            &mut failures,
+        );
+        assert_eq!(counts, (2, 2));
+        assert!(out.is_empty());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            format!(
+                "  10-git output:\n\
+                 \x20   {detail}\n\
+                 \x20 warning: merge cleanup incomplete\n\
+                 \x20 20-ignore output:\n\
+                 \x20   wrote ignore\n\
+                 \x20   {detail}\n\
+                 \x20 warning: merge cleanup incomplete\n"
+            )
+        );
+        assert_eq!(
+            failures,
+            vec![
+                ("10-git".to_string(), detail.to_string()),
+                ("20-ignore".to_string(), detail.to_string()),
             ]
         );
     }
@@ -1556,6 +1669,7 @@ mod tests {
             rc: 0,
             output: output.to_vec(),
             note: None,
+            cleanup_incomplete: false,
             has_merge: true,
             elapsed_ms: 7,
         };
@@ -1699,6 +1813,7 @@ mod tests {
                     rc: 0,
                     output: b"done".to_vec(),
                     note: None,
+                    cleanup_incomplete: false,
                     has_merge: true,
                     elapsed_ms: 7,
                 });

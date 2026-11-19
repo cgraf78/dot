@@ -1870,13 +1870,28 @@ fn pre_sync(
         let outcome = worker.pre_sync(call);
         let _ = out.write_all(&outcome.stdout);
         let _ = err.write_all(&outcome.stderr);
-        outcome.rc == 0
+        match (outcome.cleanup, outcome.rc) {
+            (Some(cleanup), _) => crate::pre_sync::Ran::CleanupIncomplete {
+                detail: cleanup.detail(),
+            },
+            (None, 0) => crate::pre_sync::Ran::Succeeded,
+            (None, _) => crate::pre_sync::Ran::Failed,
+        }
     };
     match crate::pre_sync::run(stage, &records, &trust, eligible, inputs.tmp, &mut runner) {
         Ok(outcome) if outcome.status == 0 => Ok(()),
         Ok(outcome) => {
             for warning in outcome.warnings {
                 inputs.log.warn(err, &warning);
+            }
+            // Recorded under Repos, the stage a failed pre-sync step stops,
+            // so the stage's generic resolution reason does not replace it.
+            if let Some(failure) = outcome.failure {
+                inputs.fail(
+                    crate::update_status::STAGE_REPOS,
+                    &format!("pre-sync {}", failure.name),
+                    &failure.detail,
+                );
             }
             Err(())
         }

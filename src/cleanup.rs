@@ -4427,6 +4427,151 @@ pub(crate) enum SessionEnd {
 
 pub(crate) const TEARDOWN_FAILURE_PREFIX: &str = "DOT_TEARDOWN_FAIL";
 
+/// The refusal message an unpinned survivor produces. Callers and tests
+/// match on it, so it stays the error's whole `Display` text; the typed
+/// details ride alongside in [`UnpinnedSurvivors`].
+const UNPINNED_SURVIVOR_MESSAGE: &str = "safe descendant delivery has no stable process authority";
+
+/// Survivors named per refusal. A refusal is usually one lingering helper;
+/// the cap only bounds what a pathological session can put in a warning.
+const MAX_NAMED_SURVIVORS: usize = 4;
+
+/// One live process that outlived a supervised session's leader and that
+/// teardown could not stop safely, as observed when cleanup refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Survivor {
+    pub(crate) pid: u32,
+    pub(crate) parent: u32,
+    /// The kernel's short command name, when it was still readable.
+    pub(crate) name: Option<String>,
+}
+
+/// Portable fail-closed refusal: live session members outside the leader's
+/// process group have no stable signal authority on this platform, so
+/// teardown leaves them running rather than signal a possibly reused PID.
+///
+/// Carried as the `std::io::Error` payload of the supervision call's error
+/// so existing `io::Result` plumbing is unchanged; callers that explain
+/// teardown read it back with [`unpinned_survivors`]. A typical cause is a
+/// fire-and-forget helper (a telemetry logger, say) that a hook's tools left
+/// behind in their own process group, still holding the hook's descriptors.
+#[derive(Debug)]
+pub(crate) struct UnpinnedSurvivors {
+    /// The first [`MAX_NAMED_SURVIVORS`] unpinned members, by PID.
+    pub(crate) survivors: Vec<Survivor>,
+    /// Unpinned members past the cap.
+    pub(crate) unnamed: usize,
+    /// The leader's own exit status, when it exited before the refusal
+    /// surfaced; set by the supervisor that reaped it.
+    pub(crate) exit: Option<std::process::ExitStatus>,
+}
+
+impl std::fmt::Display for UnpinnedSurvivors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(UNPINNED_SURVIVOR_MESSAGE)
+    }
+}
+
+impl std::error::Error for UnpinnedSurvivors {}
+
+/// The unpinned-survivor details of a supervision error, if it is one.
+pub(crate) fn unpinned_survivors(error: &std::io::Error) -> Option<&UnpinnedSurvivors> {
+    error.get_ref()?.downcast_ref()
+}
+
+/// Record the reaped leader's status on an unpinned-survivor refusal, so a
+/// caller can tell "the command succeeded but left a helper" from "the
+/// command failed". Any other error passes through untouched.
+fn with_leader_exit(mut error: std::io::Error, status: std::process::ExitStatus) -> std::io::Error {
+    if let Some(refusal) = error
+        .get_mut()
+        .and_then(|inner| inner.downcast_mut::<UnpinnedSurvivors>())
+    {
+        refusal.exit.get_or_insert(status);
+    }
+    error
+}
+
+/// Build the refusal for `members`, the live unpinned processes. Names are
+/// read now, while the members are still live, because the error is only
+/// rendered after teardown returns. Only the portable discovery path refuses
+/// this way; Linux and Android pin escaped members through pidfds instead.
+#[cfg_attr(any(target_os = "linux", target_os = "android"), allow(dead_code))]
+fn unpinned_survivor_error<'a>(members: impl Iterator<Item = &'a ProcessInfo>) -> std::io::Error {
+    let mut survivors = Vec::new();
+    let mut unnamed = 0;
+    for member in members {
+        if survivors.len() < MAX_NAMED_SURVIVORS {
+            survivors.push(Survivor {
+                pid: member.pid,
+                parent: member.parent,
+                name: process_name(member.pid),
+            });
+        } else {
+            unnamed += 1;
+        }
+    }
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        UnpinnedSurvivors {
+            survivors,
+            unnamed,
+            exit: None,
+        },
+    )
+}
+
+/// The kernel's short command name for `pid`, best effort. It is display
+/// only: a PID can exit or be reused between observation and this read, so
+/// nothing may act on the name.
+fn process_name(pid: u32) -> Option<String> {
+    display_process_name(&raw_process_name(pid)?)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn raw_process_name(pid: u32) -> Option<Vec<u8>> {
+    std::fs::read(format!("/proc/{pid}/comm")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn raw_process_name(pid: u32) -> Option<Vec<u8>> {
+    let pid_i32 = i32::try_from(pid).ok()?;
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    let info = macos_bsd_read(pid, pid_i32, size).ok()?;
+    // `pbi_name` holds the longer name when the kernel recorded one;
+    // `pbi_comm` is the truncated executable name.
+    let field = if info.pbi_name[0] != 0 {
+        &info.pbi_name[..]
+    } else {
+        &info.pbi_comm[..]
+    };
+    Some(
+        field
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| *byte as u8)
+            .collect(),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn raw_process_name(_pid: u32) -> Option<Vec<u8>> {
+    None
+}
+
+/// Trim and neutralize a raw kernel command name for one-line display: a
+/// process chooses its own name, so control bytes must never reach a
+/// terminal or a persisted failure record.
+fn display_process_name(raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    let name: String = text
+        .trim_end_matches('\n')
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
 fn end_after_cleanup(
     cleanup: std::io::Result<std::process::ExitStatus>,
     completed: SessionEnd,
@@ -4484,7 +4629,7 @@ fn decide_after_cleanup_reported(
         return Ok(SessionEnd::TimedOut);
     }
     if let Some(error) = deferred_error {
-        return Err(error);
+        return Err(with_leader_exit(error, status));
     }
     Ok(completed(status))
 }
@@ -9109,11 +9254,14 @@ impl Session {
             // it must not set the incomplete atomic, which would rewrite
             // the caller's explicit failure into a global 125. Genuine
             // teardown failures still fail closed through decide_after_cleanup
-            // and the stop-owned-sessions verifiers.
-            self.authority_error = Some(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "safe descendant delivery has no stable process authority",
-            ));
+            // and the stop-owned-sessions verifiers. The refusal names the
+            // unpinned members so a caller can say which process outlived
+            // its command instead of reporting a bare failure.
+            let leader = self.leader;
+            self.authority_error =
+                Some(unpinned_survivor_error(self.current.values().filter(
+                    |process| requires_direct_signal_authority(process, leader),
+                )));
         }
     }
 
@@ -15932,6 +16080,19 @@ int kill(pid_t pid, int sig) {
                 .to_string()
                 .contains("safe descendant delivery has no stable process authority")
         );
+        // The refusal names the escaped helper and says the leader itself
+        // succeeded, so a caller can explain the failure.
+        let refusal = unpinned_survivors(&error).expect("typed refusal");
+        assert_eq!(
+            refusal
+                .survivors
+                .iter()
+                .map(|survivor| survivor.pid)
+                .collect::<Vec<_>>(),
+            [pid as u32]
+        );
+        assert!(refusal.survivors[0].name.is_some());
+        assert_eq!(refusal.exit.and_then(|status| status.code()), Some(0));
         assert!(started.elapsed() < Duration::from_secs(6));
         assert!(!alive(pid), "self-bounded descendant survived");
     }
@@ -16155,6 +16316,115 @@ int kill(pid_t pid, int sig) {
         let tick_error = std::io::Error::other("drain failed");
         let error = merge_authority_errors(&mut sessions, Err(tick_error)).unwrap_err();
         assert_eq!(error.to_string(), "drain failed");
+    }
+
+    fn escaped_member(pid: u32, parent: u32) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            parent,
+            group: pid,
+            session: 11,
+            live: true,
+            identity: ProcessIdentity { pid, start: None },
+        }
+    }
+
+    #[test]
+    fn unpinned_refusal_names_its_survivors_and_keeps_its_message() {
+        let me = std::process::id();
+        let members = [escaped_member(me, 1), escaped_member(u32::MAX - 3, 11)];
+        let error = unpinned_survivor_error(members.iter());
+
+        // The message callers already match on is unchanged.
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(error.to_string(), UNPINNED_SURVIVOR_MESSAGE);
+        let refusal = unpinned_survivors(&error).expect("typed refusal");
+        assert_eq!(refusal.unnamed, 0);
+        assert_eq!(refusal.exit, None);
+        assert_eq!(refusal.survivors.len(), 2);
+        assert_eq!(
+            (refusal.survivors[0].pid, refusal.survivors[0].parent),
+            (me, 1)
+        );
+        // A live process's name is read at refusal time; a PID that no
+        // longer exists is still named by number alone.
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        assert!(refusal.survivors[0].name.is_some());
+        assert_eq!(refusal.survivors[1].name, None);
+    }
+
+    #[test]
+    fn unpinned_refusal_caps_named_survivors() {
+        let members = (0..MAX_NAMED_SURVIVORS as u32 + 3)
+            .map(|offset| escaped_member(u32::MAX - 100 + offset, 1))
+            .collect::<Vec<_>>();
+        let error = unpinned_survivor_error(members.iter());
+        let refusal = unpinned_survivors(&error).expect("typed refusal");
+        assert_eq!(refusal.survivors.len(), MAX_NAMED_SURVIVORS);
+        assert_eq!(refusal.unnamed, 3);
+    }
+
+    #[test]
+    fn untyped_errors_carry_no_survivors() {
+        assert!(unpinned_survivors(&std::io::Error::other("drain failed")).is_none());
+        let os = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert!(unpinned_survivors(&os).is_none());
+    }
+
+    #[test]
+    fn deferred_refusal_reports_the_leader_exit_status() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let refusal = unpinned_survivor_error([escaped_member(12, 1)].iter());
+        let ended = decide_after_cleanup_reported(
+            Ok(std::process::ExitStatus::from_raw(0)),
+            None,
+            Some(refusal),
+            |_| panic!("a deferred refusal must not complete"),
+            &mut |_| panic!("a refusal is not a cleanup failure"),
+        );
+        let error = ended.expect_err("the refusal is the call's error");
+        let refusal = unpinned_survivors(&error).expect("typed refusal");
+        assert_eq!(refusal.exit.and_then(|status| status.code()), Some(0));
+
+        // Any other deferred error passes through untouched.
+        let ended = decide_after_cleanup_reported(
+            Ok(std::process::ExitStatus::from_raw(0)),
+            None,
+            Some(std::io::Error::other("drain failed")),
+            |_| panic!("a deferred error must not complete"),
+            &mut |_| panic!("a deferred error is not a cleanup failure"),
+        );
+        assert_eq!(ended.unwrap_err().to_string(), "drain failed");
+    }
+
+    #[test]
+    fn leader_exit_never_overwrites_a_recorded_status() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let first = std::process::ExitStatus::from_raw(3 << 8);
+        let error = with_leader_exit(
+            unpinned_survivor_error([escaped_member(12, 1)].iter()),
+            first,
+        );
+        let error = with_leader_exit(error, std::process::ExitStatus::from_raw(0));
+        let refusal = unpinned_survivors(&error).expect("typed refusal");
+        assert_eq!(refusal.exit.and_then(|status| status.code()), Some(3));
+    }
+
+    #[test]
+    fn process_names_are_neutralized_for_display() {
+        assert_eq!(display_process_name(b"helper\n"), Some("helper".into()));
+        assert_eq!(
+            display_process_name(b"a\x1b[2Jb\tc"),
+            Some("a?[2Jb?c".into())
+        );
+        assert_eq!(
+            display_process_name(b"\xffname"),
+            Some("\u{fffd}name".into())
+        );
+        assert_eq!(display_process_name(b""), None);
+        assert_eq!(display_process_name(b"\n"), None);
     }
 
     #[test]
