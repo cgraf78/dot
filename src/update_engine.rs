@@ -1870,13 +1870,7 @@ fn pre_sync(
         let outcome = worker.pre_sync(call);
         let _ = out.write_all(&outcome.stdout);
         let _ = err.write_all(&outcome.stderr);
-        match (outcome.cleanup, outcome.rc) {
-            (Some(cleanup), _) => crate::pre_sync::Ran::CleanupIncomplete {
-                detail: cleanup.detail(),
-            },
-            (None, 0) => crate::pre_sync::Ran::Succeeded,
-            (None, _) => crate::pre_sync::Ran::Failed,
-        }
+        outcome.ran()
     };
     match crate::pre_sync::run(stage, &records, &trust, eligible, inputs.tmp, &mut runner) {
         Ok(outcome) if outcome.status == 0 => Ok(()),

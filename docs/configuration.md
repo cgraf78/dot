@@ -257,9 +257,9 @@ overwrites `update.last-failure` with its cause. The first line repeats the
 run's `<epoch> <outcome> <trigger>` from `update.last-run`; each further line
 is `item<TAB><stage><TAB><name><TAB><detail>`: a failed Shdeps item and its
 detail, a merge-hook key and the last line of its output, a pre-sync
-extension (`pre-sync <name>` under `repos`) and its failure note, a hook's
-`cleanup incomplete: …` detail when it left a process running (see
-[extensions](extensions.md)), a repository that
+extension (`pre-sync <name>` under `repos`) and its failure note, if any, a
+hook's `cleanup incomplete: …` detail when it otherwise succeeded but left a
+process running (see [extensions](extensions.md)), a repository that
 failed to pull, a file whose local edits skipped a cron run, or the stage's
 own reason (for example Shdeps' last stderr line when it stopped before
 reporting any item). At most five items per stage are kept, followed by

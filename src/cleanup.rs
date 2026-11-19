@@ -4455,7 +4455,6 @@ pub(crate) struct Survivor {
 /// teardown read it back with [`unpinned_survivors`]. A typical cause is a
 /// fire-and-forget helper (a telemetry logger, say) that a hook's tools left
 /// behind in their own process group, still holding the hook's descriptors.
-#[derive(Debug)]
 pub(crate) struct UnpinnedSurvivors {
     /// The first [`MAX_NAMED_SURVIVORS`] unpinned members, by PID.
     pub(crate) survivors: Vec<Survivor>,
@@ -4469,6 +4468,20 @@ pub(crate) struct UnpinnedSurvivors {
 impl std::fmt::Display for UnpinnedSurvivors {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(UNPINNED_SURVIVOR_MESSAGE)
+    }
+}
+
+/// `io::Error`'s `Debug` prints its payload's `Debug`, and teardown
+/// reporters log errors that way, so keep the refusal message in it too.
+impl std::fmt::Debug for UnpinnedSurvivors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnpinnedSurvivors")
+            .field("message", &UNPINNED_SURVIVOR_MESSAGE)
+            .field("survivors", &self.survivors)
+            .field("unnamed", &self.unnamed)
+            .field("exit", &self.exit)
+            .finish()
     }
 }
 
@@ -4505,7 +4518,7 @@ fn unpinned_survivor_error<'a>(members: impl Iterator<Item = &'a ProcessInfo>) -
             survivors.push(Survivor {
                 pid: member.pid,
                 parent: member.parent,
-                name: process_name(member.pid),
+                name: process_name(member),
             });
         } else {
             unnamed += 1;
@@ -4521,23 +4534,30 @@ fn unpinned_survivor_error<'a>(members: impl Iterator<Item = &'a ProcessInfo>) -
     )
 }
 
-/// The kernel's short command name for `pid`, best effort. It is display
-/// only: a PID can exit or be reused between observation and this read, so
-/// nothing may act on the name.
-fn process_name(pid: u32) -> Option<String> {
-    display_process_name(&raw_process_name(pid)?)
+/// The kernel's short command name for an observed `member`, best effort.
+/// It is display only: nothing may act on the name.
+fn process_name(member: &ProcessInfo) -> Option<String> {
+    display_process_name(&raw_process_name(member)?)
 }
 
+/// Only the macOS refusal path names processes in production; Linux and
+/// Android read `comm` for the unit tests that exercise the refusal there.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn raw_process_name(pid: u32) -> Option<Vec<u8>> {
-    std::fs::read(format!("/proc/{pid}/comm")).ok()
+fn raw_process_name(member: &ProcessInfo) -> Option<Vec<u8>> {
+    std::fs::read(format!("/proc/{}/comm", member.pid)).ok()
 }
 
 #[cfg(target_os = "macos")]
-fn raw_process_name(pid: u32) -> Option<Vec<u8>> {
+fn raw_process_name(member: &ProcessInfo) -> Option<Vec<u8>> {
+    let pid = member.pid;
     let pid_i32 = i32::try_from(pid).ok()?;
     let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
     let info = macos_bsd_read(pid, pid_i32, size).ok()?;
+    // The member was observed in an earlier snapshot; a PID that exited and
+    // was reused since must not lend the warning an unrelated name.
+    if info.pbi_ppid != member.parent || info.pbi_pgid != member.group {
+        return None;
+    }
     // `pbi_name` holds the longer name when the kernel recorded one;
     // `pbi_comm` is the truncated executable name.
     let field = if info.pbi_name[0] != 0 {
@@ -4555,19 +4575,26 @@ fn raw_process_name(pid: u32) -> Option<Vec<u8>> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-fn raw_process_name(_pid: u32) -> Option<Vec<u8>> {
+fn raw_process_name(_member: &ProcessInfo) -> Option<Vec<u8>> {
     None
 }
 
 /// Trim and neutralize a raw kernel command name for one-line display: a
-/// process chooses its own name, so control bytes must never reach a
-/// terminal or a persisted failure record.
+/// process chooses its own name, so control bytes, bidi overrides, and line
+/// separators must never reach a terminal or a persisted failure record.
+/// Kernel short names are almost always ASCII, so anything else becomes `?`
+/// rather than being classified character by character.
 fn display_process_name(raw: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(raw);
-    let name: String = text
-        .trim_end_matches('\n')
-        .chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+    let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
+    let name: String = raw
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                char::from(*byte)
+            } else {
+                '?'
+            }
+        })
         .collect();
     (!name.is_empty()).then_some(name)
 }
@@ -16056,7 +16083,9 @@ int kill(pid_t pid, int sig) {
         command
             .args([
                 "-c",
-                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; sleep 3) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
+                // `exec` keeps the escaped member one process: a forked
+                // `sleep` would be a second unpinned survivor.
+                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; exec sleep 3) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
                 "supervisor-unpinned-member",
             ])
             .arg(&marker)
@@ -16332,7 +16361,18 @@ int kill(pid_t pid, int sig) {
     #[test]
     fn unpinned_refusal_names_its_survivors_and_keeps_its_message() {
         let me = std::process::id();
-        let members = [escaped_member(me, 1), escaped_member(u32::MAX - 3, 11)];
+        // This process as a snapshot would have observed it; macOS names a
+        // member only when its parent and group still match.
+        // SAFETY: getppid and getpgrp take no arguments and cannot fail.
+        let (parent, group) = unsafe { (libc::getppid() as u32, libc::getpgrp() as u32) };
+        let members = [
+            ProcessInfo {
+                parent,
+                group,
+                ..escaped_member(me, parent)
+            },
+            escaped_member(u32::MAX - 3, 11),
+        ];
         let error = unpinned_survivor_error(members.iter());
 
         // The message callers already match on is unchanged.
@@ -16344,8 +16384,14 @@ int kill(pid_t pid, int sig) {
         assert_eq!(refusal.survivors.len(), 2);
         assert_eq!(
             (refusal.survivors[0].pid, refusal.survivors[0].parent),
-            (me, 1)
+            (me, parent)
         );
+        // The message survives `Debug` too, which teardown reporters log.
+        assert!(format!("{error:?}").contains(UNPINNED_SURVIVOR_MESSAGE));
+        // A PID whose parent or group no longer matches the observation may
+        // have been reused, so macOS leaves it unnamed.
+        #[cfg(target_os = "macos")]
+        assert_eq!(process_name(&escaped_member(me, 1)), None);
         // A live process's name is read at refusal time; a PID that no
         // longer exists is still named by number alone.
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
@@ -16419,10 +16465,13 @@ int kill(pid_t pid, int sig) {
             display_process_name(b"a\x1b[2Jb\tc"),
             Some("a?[2Jb?c".into())
         );
+        assert_eq!(display_process_name(b"\xffname"), Some("?name".into()));
+        // A right-to-left override (U+202E) could reorder the warning line.
         assert_eq!(
-            display_process_name(b"\xffname"),
-            Some("\u{fffd}name".into())
+            display_process_name("ab\u{202e}cd".as_bytes()),
+            Some("ab???cd".into())
         );
+        assert_eq!(display_process_name(b"two words"), Some("two words".into()));
         assert_eq!(display_process_name(b""), None);
         assert_eq!(display_process_name(b"\n"), None);
     }

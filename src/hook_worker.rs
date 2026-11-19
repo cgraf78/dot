@@ -56,6 +56,20 @@ pub(crate) struct PreSyncOutcome {
     pub(crate) cleanup: Option<IncompleteCleanup>,
 }
 
+impl PreSyncOutcome {
+    /// How the pre-sync coordinator sees this end.
+    pub(crate) fn ran(&self) -> crate::pre_sync::Ran {
+        match (&self.cleanup, self.rc) {
+            (Some(cleanup), _) => crate::pre_sync::Ran::CleanupIncomplete {
+                detail: cleanup.detail(),
+                exit: cleanup.exit(),
+            },
+            (None, 0) => crate::pre_sync::Ran::Succeeded,
+            (None, _) => crate::pre_sync::Ran::Failed,
+        }
+    }
+}
+
 /// One merge hook's end: the worker outcome plus, apart from it, whether
 /// teardown of its session could not finish.
 pub(crate) struct MergeOutcome {
@@ -91,6 +105,16 @@ pub(crate) struct IncompleteCleanup {
 pub(crate) const CLEANUP_INCOMPLETE: &str = "cleanup incomplete";
 
 impl IncompleteCleanup {
+    /// A report as the supervisor would build it, for coordinator tests.
+    #[cfg(test)]
+    pub(crate) fn new(exit: Option<i32>, survivors: Vec<crate::cleanup::Survivor>) -> Self {
+        Self {
+            exit,
+            survivors,
+            unnamed: 0,
+        }
+    }
+
     /// Teardown failed without saying which process it could not stop.
     fn unexplained() -> Self {
         Self {
@@ -110,7 +134,7 @@ impl IncompleteCleanup {
 
     /// One line for warnings and `update.last-failure`, e.g. `cleanup
     /// incomplete: the hook exited 0, but pid 4242 (helper, parent 1) was
-    /// still running in its session`.
+    /// left running in the hook's session`.
     pub(crate) fn detail(&self) -> String {
         let named = self.survivors.iter().map(|survivor| match &survivor.name {
             Some(name) => format!("{} ({name}, parent {})", survivor.pid, survivor.parent),
@@ -140,19 +164,49 @@ impl IncompleteCleanup {
             ("pids", "were")
         };
         let list = english_list(&items);
+        // "Left running" rather than "still running": teardown refused to
+        // signal them, so they keep running after this report.
         match self.exit {
             Some(0) => format!(
-                "{CLEANUP_INCOMPLETE}: the hook exited 0, but {noun} {list} {verb} still running \
-                 in its session"
+                "{CLEANUP_INCOMPLETE}: the hook exited 0, but {noun} {list} {verb} left running \
+                 in the hook's session"
             ),
             Some(code) => format!(
-                "{CLEANUP_INCOMPLETE}: the hook exited {code}, and {noun} {list} {verb} still \
-                 running in its session"
+                "{CLEANUP_INCOMPLETE}: the hook exited {code}, and {noun} {list} {verb} left \
+                 running in the hook's session"
             ),
             None => format!(
-                "{CLEANUP_INCOMPLETE}: {noun} {list} {verb} still running in the hook's session"
+                "{CLEANUP_INCOMPLETE}: {noun} {list} {verb} left running in the hook's session"
             ),
         }
+    }
+
+    /// The hook's own exit status, when the supervisor observed it.
+    pub(crate) fn exit(&self) -> Option<i32> {
+        self.exit
+    }
+}
+
+/// Whether a worker failure note with `status` describes the end of a hook
+/// whose teardown could not finish, given its observed `exit`. The note is
+/// written by the hook's own ERR/EXIT traps, so it carries the status the
+/// hook ended with; with no observed status any note is this run's, since
+/// every worker gets a fresh scratch directory.
+pub(crate) fn note_describes_exit(exit: Option<i32>, status: i32) -> bool {
+    exit.is_none_or(|code| code == status)
+}
+
+/// Whether a hook whose teardown could not finish also failed on its own.
+/// `noted` says whether a note passed [`note_describes_exit`]: with no
+/// observed exit status, only a note proves the hook failed.
+///
+/// Such a hook reports its own failure first (`failed`, its note, its last
+/// line) and the teardown detail after; one that succeeded reports the
+/// teardown alone, since that is all that needs fixing.
+pub(crate) fn hook_failed(exit: Option<i32>, noted: bool) -> bool {
+    match exit {
+        Some(code) => code != 0,
+        None => noted,
     }
 }
 
@@ -679,7 +733,8 @@ enum Waited {
     /// The deadline passed; the session was stopped with the bounded
     /// TERM-then-KILL teardown.
     TimedOut,
-    /// The launch or an abort failed.
+    /// The launch, an abort, or teardown failed in a way that is not an
+    /// incomplete cleanup (for example a signal-delivery error).
     Failed,
     /// The worker ended, but teardown could not prove that every process
     /// in its session stopped.
@@ -699,35 +754,32 @@ impl Waited {
 /// `deadline` passes. The CLI owns the signal handler; parallel hook threads
 /// only observe its atomic result and perform teardown for their own session.
 ///
-/// A failing tick (an abort) makes the supervisor run its graceful
-/// TERM-then-KILL teardown and report incomplete cleanup; that is the
-/// caller's own cancellation, so it stays a plain failure rather than a
-/// teardown report.
+/// An abort is the caller's own cancellation: its error is untyped, so it
+/// stays a plain failure, and the supervisor gives a pending tick error
+/// precedence over an unpinned-survivor refusal. Only the doctor passes
+/// `abort`, and its outcome carries no teardown report.
 fn wait_session(
     command: Command,
     abort: Option<&AtomicBool>,
     deadline: Option<std::time::Instant>,
 ) -> Waited {
-    let aborted = || abort.is_some_and(|abort| abort.load(Ordering::SeqCst));
-    let tick = |_| {
-        if aborted() {
+    let tick = |_| match abort {
+        Some(abort) if abort.load(Ordering::SeqCst) => {
             Err(std::io::Error::other("doctor extension aborted"))
-        } else {
-            Ok(())
         }
+        _ => Ok(()),
     };
     match crate::cleanup::supervise_session(command, deadline, tick) {
         Ok(crate::cleanup::SessionEnd::Exited(status)) => Waited::Status(status_code(status)),
         Ok(crate::cleanup::SessionEnd::Interrupted(signal)) => Waited::Status(128 + signal),
         Ok(crate::cleanup::SessionEnd::TimedOut) => Waited::TimedOut,
-        Ok(crate::cleanup::SessionEnd::CleanupIncomplete) if !aborted() => {
+        Ok(crate::cleanup::SessionEnd::CleanupIncomplete) => {
             Waited::CleanupIncomplete(IncompleteCleanup::unexplained())
         }
         Err(error) => match crate::cleanup::unpinned_survivors(&error) {
             Some(refusal) => Waited::CleanupIncomplete(IncompleteCleanup::from_refusal(refusal)),
             None => Waited::Failed,
         },
-        Ok(crate::cleanup::SessionEnd::CleanupIncomplete) => Waited::Failed,
     }
 }
 
@@ -1113,7 +1165,10 @@ mod tests {
         command
             .args([
                 "-c",
-                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; sleep 3) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
+                // `exec` keeps the escaped member one process: a Bash that
+                // forks a subshell's last command would add a second
+                // unpinned survivor.
+                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; exec sleep 3) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
                 "hook-descendant",
             ])
             .arg(&marker)
@@ -1189,26 +1244,61 @@ mod tests {
     fn incomplete_cleanup_detail_names_what_outlived_the_hook() {
         assert_eq!(
             cleanup(Some(0), vec![survivor(42, Some("helper"))], 0),
-            "cleanup incomplete: the hook exited 0, but pid 42 (helper, parent 1) was still \
-             running in its session"
+            "cleanup incomplete: the hook exited 0, but pid 42 (helper, parent 1) was left \
+             running in the hook's session"
         );
         // A name the kernel no longer had leaves the PID and parent.
         assert_eq!(
             cleanup(Some(0), vec![survivor(42, None)], 0),
-            "cleanup incomplete: the hook exited 0, but pid 42 (parent 1) was still running in \
-             its session"
+            "cleanup incomplete: the hook exited 0, but pid 42 (parent 1) was left running in \
+             the hook's session"
         );
         // A failing hook says so too: both need fixing.
         assert_eq!(
             cleanup(Some(3), vec![survivor(42, Some("helper"))], 0),
-            "cleanup incomplete: the hook exited 3, and pid 42 (helper, parent 1) was still \
-             running in its session"
+            "cleanup incomplete: the hook exited 3, and pid 42 (helper, parent 1) was left \
+             running in the hook's session"
         );
         assert_eq!(
             cleanup(None, vec![survivor(42, Some("helper"))], 0),
-            "cleanup incomplete: pid 42 (helper, parent 1) was still running in the hook's \
+            "cleanup incomplete: pid 42 (helper, parent 1) was left running in the hook's \
              session"
         );
+    }
+
+    #[test]
+    fn pre_sync_outcomes_map_to_the_coordinators_view() {
+        let outcome = |rc, cleanup| super::PreSyncOutcome {
+            rc,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            cleanup,
+        };
+        assert_eq!(outcome(0, None).ran(), crate::pre_sync::Ran::Succeeded);
+        assert_eq!(outcome(3, None).ran(), crate::pre_sync::Ran::Failed);
+        // A teardown report wins over the forced worker status, and carries
+        // the hook's own exit for note matching.
+        let report = super::IncompleteCleanup::new(Some(3), vec![survivor(42, Some("helper"))]);
+        assert_eq!(
+            outcome(1, Some(report.clone())).ran(),
+            crate::pre_sync::Ran::CleanupIncomplete {
+                detail: report.detail(),
+                exit: Some(3),
+            }
+        );
+    }
+
+    #[test]
+    fn a_hook_with_an_incomplete_teardown_failed_only_on_proof() {
+        // An observed exit decides; without one only a note proves failure.
+        assert!(!super::hook_failed(Some(0), true));
+        assert!(super::hook_failed(Some(3), false));
+        assert!(super::hook_failed(None, true));
+        assert!(!super::hook_failed(None, false));
+        // A note describes the hook's end only for its own status.
+        assert!(super::note_describes_exit(Some(3), 3));
+        assert!(!super::note_describes_exit(Some(3), 5));
+        assert!(super::note_describes_exit(None, 5));
     }
 
     #[test]
@@ -1220,7 +1310,7 @@ mod tests {
                 0
             ),
             "cleanup incomplete: the hook exited 0, but pids 42 (a, parent 1) and 43 (parent 1) \
-             were still running in its session"
+             were left running in the hook's session"
         );
         assert_eq!(
             cleanup(
@@ -1229,7 +1319,7 @@ mod tests {
                 2
             ),
             "cleanup incomplete: the hook exited 0, but pids 42 (a, parent 1), 43 (b, parent 1), \
-             and 2 more were still running in its session"
+             and 2 more were left running in the hook's session"
         );
     }
 
@@ -1264,8 +1354,8 @@ mod tests {
 
     #[test]
     fn aborted_worker_is_a_failure_not_a_teardown_report() {
-        // An abort is the caller's own cancellation: its teardown outcome
-        // must not be reported as something the hook left behind.
+        // An abort is the caller's own cancellation, an untyped error that
+        // must stay a plain failure rather than read as a teardown report.
         let abort = std::sync::atomic::AtomicBool::new(true);
         let mut command = Command::new(dot_test_support::bash());
         command

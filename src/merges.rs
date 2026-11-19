@@ -649,55 +649,96 @@ struct ResultRecord {
     rc: i32,
     output: Vec<u8>,
     /// The worker's failure note as one detail line (`exited with status N
-    /// at <file>:<line>: <command>`), for a failed hook that left one, or
-    /// the incomplete-cleanup detail when `cleanup_incomplete` is set.
+    /// at <file>:<line>: <command>`), for a failed hook that left one.
     note: Option<Vec<u8>>,
-    /// The hook's session could not be torn down: the note says what was
-    /// left running, and that, not the hook's output, is the failure.
-    cleanup_incomplete: bool,
+    /// Set when the hook's session could not be torn down.
+    cleanup: Option<Teardown>,
     has_merge: bool,
     elapsed_ms: i64,
+}
+
+/// What a merge record keeps of an incomplete teardown.
+struct Teardown {
+    /// The one-line `cleanup incomplete: …` detail.
+    detail: Vec<u8>,
+    /// The hook also failed on its own (see [`crate::hook_worker::hook_failed`]).
+    hook_failed: bool,
 }
 
 impl ResultRecord {
     /// The capture as rendered: the hook's own output, then the note line, so
     /// even a hook that failed silently (a bare `|| return 1`) names the line
-    /// that stopped it.
+    /// that stopped it, then what its teardown left running.
     fn shown_output(&self) -> std::borrow::Cow<'_, [u8]> {
-        let Some(note) = &self.note else {
+        let extra = [
+            self.note.as_deref(),
+            self.cleanup.as_ref().map(|cleanup| &cleanup.detail[..]),
+        ];
+        if extra.iter().all(Option::is_none) {
             return std::borrow::Cow::Borrowed(&self.output);
-        };
+        }
         let mut shown = self.output.clone();
-        if !shown.is_empty() && !shown.ends_with(b"\n") {
+        for line in extra.into_iter().flatten() {
+            if !shown.is_empty() && !shown.ends_with(b"\n") {
+                shown.push(b'\n');
+            }
+            shown.extend_from_slice(line);
             shown.push(b'\n');
         }
-        shown.extend_from_slice(note);
-        shown.push(b'\n');
         std::borrow::Cow::Owned(shown)
     }
 
-    /// The recorded failure detail. A hook's own last line usually names the
+    /// Whether only the teardown failed: the hook itself succeeded, so the
+    /// row reads `cleanup incomplete` rather than `failed`.
+    fn only_cleanup_failed(&self) -> bool {
+        self.cleanup
+            .as_ref()
+            .is_some_and(|cleanup| !cleanup.hook_failed)
+    }
+
+    /// The recorded failure detail. A hook that failed on its own records its
+    /// own cause, as below, falling back to the teardown detail when it gave
+    /// none; one that only left a process running records the teardown.
+    fn failure_detail(&self) -> String {
+        let teardown = || {
+            self.cleanup
+                .as_ref()
+                .map(|cleanup| crate::update_status::last_line(&cleanup.detail))
+                .unwrap_or_default()
+        };
+        if self.only_cleanup_failed() {
+            // The hook's own last line describes a run that succeeded.
+            return teardown();
+        }
+        // A bare title names the hook, not the cause; with no note to stand
+        // in for it, the teardown detail says more.
+        if self.cleanup.is_some() && self.note.is_none() && self.title_only() {
+            return teardown();
+        }
+        let own = self.hook_failure_detail();
+        if own.is_empty() { teardown() } else { own }
+    }
+
+    /// The hook's own failure detail. Its own last line usually names the
     /// cause (hooks warn just before they fail), so it wins; the note stands
     /// in for a hook that printed nothing but its opening title (`Git`),
     /// which names the hook rather than the cause.
-    fn failure_detail(&self) -> String {
-        if let (true, Some(note)) = (self.cleanup_incomplete, &self.note) {
-            // The hook's own last line describes a run that may well have
-            // succeeded; what failed is the teardown the note explains.
-            return crate::update_status::last_line(note);
-        }
+    fn hook_failure_detail(&self) -> String {
         let own = crate::update_status::last_line(&self.output);
         let Some(note) = &self.note else {
             return own;
         };
-        let (first, rest) = result_label_bytes(&self.hook.key, &self.output);
-        let title_only =
-            rest.is_empty() && names_hook(&first, label_from_script(&self.hook.key).as_bytes());
-        if own.is_empty() || title_only {
+        if own.is_empty() || self.title_only() {
             crate::update_status::last_line(note)
         } else {
             own
         }
+    }
+
+    /// The hook printed nothing but its opening title.
+    fn title_only(&self) -> bool {
+        let (first, rest) = result_label_bytes(&self.hook.key, &self.output);
+        rest.is_empty() && names_hook(&first, label_from_script(&self.hook.key).as_bytes())
     }
 }
 
@@ -729,7 +770,7 @@ fn run_one(
             rc: 1,
             output: b"dot: cannot create private merge-hook TMPDIR\n".to_vec(),
             note: None,
-            cleanup_incomplete: false,
+            cleanup: None,
             has_merge: false,
             elapsed_ms: 0,
         };
@@ -769,29 +810,52 @@ fn run_one(
     let has_merge = std::fs::read_to_string(&result)
         .ok()
         .is_some_and(|value| value.trim() == "1");
-    let note = match &cleanup {
-        // The teardown detail already carries the hook's own exit status,
-        // and a worker note could only describe a status other than the
-        // one the hook ended with.
-        Some(cleanup) => Some(cleanup.detail().into_bytes()),
-        // A note whose status differs from the exit status is about some
-        // other failure the hook survived, so it would blame the wrong line.
-        None => (rc != 0)
-            .then(|| crate::doctor_orchestrator::FailureNote::read(&result))
-            .flatten()
-            .filter(|note| note.status == rc)
-            .map(|note| note.detail()),
-    };
+    let (note, cleanup) = worker_reports(rc, cleanup.as_ref(), || {
+        crate::doctor_orchestrator::FailureNote::read(&result)
+    });
     let _ = std::fs::remove_dir_all(&temporary);
     ResultRecord {
         hook,
         rc,
         output,
         note,
-        cleanup_incomplete: cleanup.is_some(),
+        cleanup,
         has_merge,
         elapsed_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
     }
+}
+
+/// The failure note and teardown report of one finished worker. `read_note`
+/// reads the worker's failure note and runs only when one could apply.
+fn worker_reports(
+    rc: i32,
+    cleanup: Option<&crate::hook_worker::IncompleteCleanup>,
+    read_note: impl FnOnce() -> Option<crate::doctor_orchestrator::FailureNote>,
+) -> (Option<Vec<u8>>, Option<Teardown>) {
+    let Some(cleanup) = cleanup else {
+        // A note whose status differs from the exit status is about some
+        // other failure the hook survived, so it would blame the wrong line.
+        let note = (rc != 0)
+            .then(read_note)
+            .flatten()
+            .filter(|note| note.status == rc)
+            .map(|note| note.detail());
+        return (note, None);
+    };
+    // An incomplete teardown forces the worker's rc to 1, so a note is
+    // matched against the hook's own observed exit instead. A hook that
+    // exited 0 cannot have failed on a line.
+    let note = read_note()
+        .filter(|note| {
+            note.status != 0 && crate::hook_worker::note_describes_exit(cleanup.exit(), note.status)
+        })
+        .map(|note| note.detail());
+    let hook_failed = crate::hook_worker::hook_failed(cleanup.exit(), note.is_some());
+    let teardown = Teardown {
+        detail: cleanup.detail().into_bytes(),
+        hook_failed,
+    };
+    (note, Some(teardown))
 }
 
 /// Wait for one FIFO-window worker's record, redrawing the live
@@ -828,7 +892,7 @@ fn wait_for_worker(
                     rc: 1,
                     output: Vec::new(),
                     note: None,
-                    cleanup_incomplete: false,
+                    cleanup: None,
                     has_merge: false,
                     elapsed_ms: 0,
                 };
@@ -979,7 +1043,7 @@ fn replay(
             // whose teardown could not finish may not have failed at all.
             let outcome = if crate::cleanup::received_signal().is_some() {
                 "interrupted"
-            } else if record.cleanup_incomplete {
+            } else if record.only_cleanup_failed() {
                 crate::hook_worker::CLEANUP_INCOMPLETE
             } else {
                 "failed"
@@ -1318,7 +1382,7 @@ mod tests {
             rc: 0,
             output: output.to_vec(),
             note: None,
-            cleanup_incomplete: false,
+            cleanup: None,
             has_merge: true,
             elapsed_ms: 7,
         };
@@ -1394,7 +1458,7 @@ mod tests {
             rc: 1,
             output: output.to_vec(),
             note: Some(note.to_vec()),
-            cleanup_incomplete: false,
+            cleanup: None,
             has_merge: true,
             elapsed_ms: 7,
         };
@@ -1500,16 +1564,22 @@ mod tests {
             log: &log,
         };
         let detail = "cleanup incomplete: the hook exited 0, but pid 42 (helper, parent 1) \
-                      was still running in its session";
-        let incomplete = |key: &str, output: &[u8]| ResultRecord {
+                      was left running in the hook's session";
+        let failed_detail = "cleanup incomplete: the hook exited 3, and pid 42 (helper, parent \
+                             1) was left running in the hook's session";
+        let note = "exited with status 3 at merge-hooks.d/30-ssh.sh:4: return 3";
+        let record = |key: &str, output: &[u8], note: Option<&str>, teardown: &str| ResultRecord {
             hook: Hook {
                 key: OsString::from(key),
                 script: std::path::PathBuf::from(format!("{key}.sh")),
             },
             rc: 1,
             output: output.to_vec(),
-            note: Some(detail.as_bytes().to_vec()),
-            cleanup_incomplete: true,
+            note: note.map(|note| note.as_bytes().to_vec()),
+            cleanup: Some(super::Teardown {
+                detail: teardown.as_bytes().to_vec(),
+                hook_failed: note.is_some(),
+            }),
             has_merge: true,
             elapsed_ms: 7,
         };
@@ -1518,15 +1588,18 @@ mod tests {
         let mut failures = Vec::new();
         let counts = super::replay(
             vec![
-                incomplete("10-git", b""),
-                incomplete("20-ignore", b"wrote ignore\n"),
+                record("10-git", b"", None, detail),
+                record("20-ignore", b"wrote ignore\n", None, detail),
+                // A hook that failed on its own still says `failed` and
+                // keeps the line that stopped it, ahead of the teardown.
+                record("30-ssh", b"", Some(note), failed_detail),
             ],
             &inputs,
             &mut out,
             &mut err,
             &mut failures,
         );
-        assert_eq!(counts, (2, 2));
+        assert_eq!(counts, (3, 3));
         assert!(out.is_empty());
         assert_eq!(
             String::from_utf8(err).unwrap(),
@@ -1537,7 +1610,11 @@ mod tests {
                  \x20 20-ignore output:\n\
                  \x20   wrote ignore\n\
                  \x20   {detail}\n\
-                 \x20 warning: merge cleanup incomplete\n"
+                 \x20 warning: merge cleanup incomplete\n\
+                 \x20 30-ssh output:\n\
+                 \x20   {note}\n\
+                 \x20   {failed_detail}\n\
+                 \x20 warning: merge failed\n"
             )
         );
         assert_eq!(
@@ -1545,8 +1622,100 @@ mod tests {
             vec![
                 ("10-git".to_string(), detail.to_string()),
                 ("20-ignore".to_string(), detail.to_string()),
+                ("30-ssh".to_string(), note.to_string()),
             ]
         );
+    }
+
+    fn note(status: i32) -> crate::doctor_orchestrator::FailureNote {
+        crate::doctor_orchestrator::FailureNote {
+            status,
+            loading: false,
+            location: b"merge-hooks.d/10-a.sh:4".to_vec(),
+            command: format!("return {status}").into_bytes(),
+        }
+    }
+
+    #[test]
+    fn worker_reports_keep_a_failed_hooks_note_beside_its_teardown() {
+        let survivor = crate::cleanup::Survivor {
+            pid: 42,
+            parent: 1,
+            name: Some("helper".into()),
+        };
+        let cleanup =
+            |exit| crate::hook_worker::IncompleteCleanup::new(exit, vec![survivor.clone()]);
+
+        // The hook succeeded: only the teardown is reported, and a stray note
+        // cannot blame a line.
+        let (shown, teardown) = super::worker_reports(1, Some(&cleanup(Some(0))), || Some(note(3)));
+        assert_eq!(shown, None);
+        assert!(!teardown.expect("teardown").hook_failed);
+
+        // The hook failed with status 3: the worker forced rc 1, yet its
+        // note for status 3 is this run's and is kept.
+        let (shown, teardown) = super::worker_reports(1, Some(&cleanup(Some(3))), || Some(note(3)));
+        assert_eq!(shown, Some(note(3).detail()));
+        let teardown = teardown.expect("teardown");
+        assert!(teardown.hook_failed);
+        assert!(
+            String::from_utf8(teardown.detail)
+                .unwrap()
+                .starts_with("cleanup incomplete: the hook exited 3, and pid 42")
+        );
+
+        // A note for some other status is about a failure the hook survived.
+        let (shown, teardown) = super::worker_reports(1, Some(&cleanup(Some(3))), || Some(note(5)));
+        assert_eq!(shown, None);
+        assert!(teardown.expect("teardown").hook_failed);
+
+        // With no observed exit, a note is what proves the hook failed.
+        let (shown, teardown) = super::worker_reports(1, Some(&cleanup(None)), || Some(note(5)));
+        assert_eq!(shown, Some(note(5).detail()));
+        assert!(teardown.expect("teardown").hook_failed);
+        let (shown, teardown) = super::worker_reports(1, Some(&cleanup(None)), || None);
+        assert_eq!(shown, None);
+        assert!(!teardown.expect("teardown").hook_failed);
+    }
+
+    #[test]
+    fn failed_title_only_hook_records_its_teardown_not_its_title() {
+        // A hook that failed without a note and printed only its title
+        // records the teardown detail, which says more than `Git`.
+        let detail = "cleanup incomplete: the hook exited 3, and pid 42 (helper, parent 1) was \
+                      left running in the hook's session";
+        let record = |output: &[u8]| ResultRecord {
+            hook: Hook {
+                key: OsString::from("git"),
+                script: std::path::PathBuf::from("git.sh"),
+            },
+            rc: 1,
+            output: output.to_vec(),
+            note: None,
+            cleanup: Some(super::Teardown {
+                detail: detail.as_bytes().to_vec(),
+                hook_failed: true,
+            }),
+            has_merge: true,
+            elapsed_ms: 7,
+        };
+        assert_eq!(record(b"Git\n").failure_detail(), detail);
+        // A hook that warned before failing keeps its own warning.
+        assert_eq!(
+            record(b"Git\nwarning: cannot parse settings\n").failure_detail(),
+            "warning: cannot parse settings"
+        );
+    }
+
+    #[test]
+    fn worker_reports_without_teardown_match_notes_to_the_exit() {
+        let (shown, teardown) = super::worker_reports(3, None, || Some(note(3)));
+        assert_eq!((shown, teardown.is_none()), (Some(note(3).detail()), true));
+        let (shown, _) = super::worker_reports(3, None, || Some(note(5)));
+        assert_eq!(shown, None);
+        // A successful hook never reads a note.
+        let (shown, _) = super::worker_reports(0, None, || panic!("must not read a note"));
+        assert_eq!(shown, None);
     }
 
     #[test]
@@ -1669,7 +1838,7 @@ mod tests {
             rc: 0,
             output: output.to_vec(),
             note: None,
-            cleanup_incomplete: false,
+            cleanup: None,
             has_merge: true,
             elapsed_ms: 7,
         };
@@ -1813,7 +1982,7 @@ mod tests {
                     rc: 0,
                     output: b"done".to_vec(),
                     note: None,
-                    cleanup_incomplete: false,
+                    cleanup: None,
                     has_merge: true,
                     elapsed_ms: 7,
                 });
