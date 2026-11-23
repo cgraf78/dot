@@ -64,9 +64,16 @@ unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS
 unset GIT_ICASE_PATHSPECS
 
 for test_file in "$root"/tests/*-test; do
-  [[ -f "$test_file" && -x "$test_file" ]] || continue
+  [[ -f $test_file ]] || continue
+  suite=${test_file##*/}
+  # The acceptance workflow invokes the release suite separately with Bash.
+  [[ $suite != release-scripts-test ]] || continue
+  if [[ ! -x $test_file ]]; then
+    printf 'tests/run: native shell suite is not executable: %s\n' "$test_file" >&2
+    exit 1
+  fi
   cp "$root/tests/provider-suite-wrapper" \
-    "$wrapper_root/${test_file##*/}"
+    "$wrapper_root/$suite"
 done
 
 run_env=(
