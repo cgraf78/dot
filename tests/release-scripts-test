@@ -1080,6 +1080,18 @@ HOLDER
     'performance driver diagnoses an invalid scratch parent before mktemp'
   assert_fresh_preflight_failure 'scratch-parent preflight failure'
 
+  colon_tmp=$DOT_TEST_TMP/scratch:with-colon
+  mkdir -p "$colon_tmp"
+  reset_preflight_artifacts
+  colon_tmp_output=
+  if colon_tmp_output=$(DOT_PERF_ARTIFACT_DIR=$preflight_artifacts \
+    RUNNER_TEMP=$colon_tmp "$DOT_TEST_ROOT/scripts/benchmark-port.sh" 2>&1); then
+    fail 'performance driver accepted a colon in its scratch PATH entry'
+  fi
+  assert_contains 'scratch parent cannot contain a colon' "$colon_tmp_output" \
+    'performance driver rejects scratch parents that would bypass the curl fixture'
+  assert_fresh_preflight_failure 'scratch-parent PATH separator failure'
+
   fake_mktemp=$DOT_TEST_TMP/failing-mktemp
   cat >"$fake_mktemp" <<'EOF'
 #!/bin/sh
