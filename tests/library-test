@@ -143,20 +143,36 @@ fi
 # The shipped shell payload runs under each platform's default Bash,
 # including 3.2 on macOS, which the Linux-only Rust suite never
 # exercises. Ban post-3.2 constructs statically so they fail here
-# instead of on a Mac. The patterns stay clear of full-line comments
-# and use portable ERE (no GNU-only `\|` or `\b`) for BSD grep.
+# instead of on a Mac. Ignore full-line comments and use portable ERE
+# (no GNU-only `\|` or `\b`) for BSD grep.
+bash32_inventory=$DOT_TEST_TMP/payload-shell-files
+# Keep the checkout name out of find's pattern, where it could be a glob.
+(
+  CDPATH='' cd -P -- "$DOT_TEST_ROOT" &&
+    find ./lib ./bin ./support -type f \( -name '*.sh' -o -path './bin/*' \) -print0
+) >"$bash32_inventory" || fail 'cannot enumerate shell payload for Bash 3.2'
+
 bash32_violations=$DOT_TEST_TMP/payload-bash32
+bash32_comment='^[0-9]*:[[:space:]]*#'
 : >"$bash32_violations"
 while IFS= read -r -d '' payload_file; do
-  grep -nE \
+  payload_file=$DOT_TEST_ROOT/${payload_file#./}
+  if payload_matches=$(grep -nE \
     -e '(^|[;|&])[[:space:]]*(declare|local|typeset)[[:space:]]+-[a-zA-Z]*A([^A-Za-z0-9_]|$)' \
     -e '(^|[;|&])[[:space:]]*(mapfile|readarray|coproc)([^A-Za-z0-9_]|$)' \
     -e '&>>' -e ';;&' -e ';&' -e '[,^][,^]}' -e '[A-Za-z0-9_][,^]}' \
     -e '[|]&' -e 'exec[[:space:]]*[{][A-Za-z_]' -e 'globstar' \
-    "$payload_file" | grep -v '^[0-9]*:[[:space:]]*#' |
-    sed "s|^|$payload_file:|" >>"$bash32_violations" || true
-done < <(find "$DOT_TEST_ROOT/lib" "$DOT_TEST_ROOT/bin" "$DOT_TEST_ROOT/support" \
-  -type f \( -name '*.sh' -o -path "$DOT_TEST_ROOT/bin/*" \) -print0)
+    "$payload_file"); then
+    while IFS= read -r payload_match; do
+      [[ $payload_match =~ $bash32_comment ]] && continue
+      printf '%s:%s\n' "$payload_file" "$payload_match" >>"$bash32_violations"
+    done <<<"$payload_matches"
+  else
+    scan_status=$?
+    # Grep uses status 1 for a clean file. Larger statuses invalidate the scan.
+    [[ $scan_status -eq 1 ]] || fail "cannot scan shell payload for Bash 3.2: $payload_file"
+  fi
+done <"$bash32_inventory"
 if [[ -s $bash32_violations ]]; then
   bash32_count=$(grep -c . "$bash32_violations")
   bash32_sample=$(head -n 5 "$bash32_violations" | tr '\n' ';')
