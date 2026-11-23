@@ -85,6 +85,56 @@ assert_eq 0 "$empty_env_status" \
   "timeout command runs without PATH (output: $empty_env_output)"
 assert_eq ok "$empty_env_output" 'timeout command relays output without PATH'
 
+# Run the real portability suite against an isolated copy of its inputs.
+library_fixture="$DOT_TEST_TMP/library [policy]"
+mkdir -p "$library_fixture/tests/lib" "$library_fixture/docs" \
+  "$library_fixture/bin" "$library_fixture/lib/dot" "$library_fixture/support"
+cp "$root/tests/library-test" "$library_fixture/tests/"
+cp "$root/tests/lib/test.sh" "$library_fixture/tests/lib/"
+cp "$root/docs/library.md" "$library_fixture/docs/"
+cp -R "$root/lib/dot/public" "$library_fixture/lib/dot/"
+policy_file="$library_fixture/bin/fixture path"
+
+run_library_policy() (
+  export LIBRARY_FIXTURE_FAULT=$1 LIBRARY_FIXTURE_ROOT=$library_fixture
+  export LIBRARY_FIXTURE_FILE=$policy_file
+  # The real suite's test helper adjusts PATH, so scope these Bash seams to
+  # the child invocation without depending on executable search order.
+  # shellcheck disable=SC2329 # Used by the child Bash.
+  find() {
+    if [[ $LIBRARY_FIXTURE_FAULT == inventory && $PWD == "$LIBRARY_FIXTURE_ROOT" && $1 == ./lib ]]; then
+      printf '%s\0' './lib/dot/public/api-version.sh'
+      return 43
+    fi
+    command find "$@"
+  }
+  # shellcheck disable=SC2329 # Used by the child Bash.
+  grep() {
+    if [[ $LIBRARY_FIXTURE_FAULT == scan && $1 == -nE && ${!#} == "$LIBRARY_FIXTURE_FILE" ]]; then
+      return 2
+    fi
+    command grep "$@"
+  }
+  export -f find grep
+  env -u BASH_ENV -u ENV "$BASH" "$library_fixture/tests/library-test"
+)
+
+printf '# Example only; mapfile -t values\n' >"$policy_file"
+library_output=$(run_library_policy none 2>&1) || fail "library policy rejected clean fixture: $library_output"
+assert_eq 'library-test: ok' "$library_output" 'library policy ignores comments and no matches'
+printf 'mapfile -t values\n' >"$policy_file"
+for library_fault in none inventory scan; do
+  library_status=0
+  library_output=$(run_library_policy "$library_fault" 2>&1) || library_status=$?
+  assert_eq 1 "$library_status" "library policy rejects $library_fault fixture"
+  case $library_fault in
+    none) expected_diagnostic='payload needs Bash 3.2' ;;
+    inventory) expected_diagnostic='cannot enumerate shell payload' ;;
+    scan) expected_diagnostic="cannot scan shell payload for Bash 3.2: $policy_file" ;;
+  esac
+  assert_contains "$expected_diagnostic" "$library_output" "library policy reports $library_fault failure"
+done
+
 # Interpreter startup is a protocol phase, not part of the output-drain
 # timeout. A gated real relay must prevent exec until it can transfer bytes.
 "$timeout_python" "$root/tests/timeout-relay-startup.py" "$timeout_command"
