@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-DOT_TEST_ROOT=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+DOT_TEST_ROOT=$(CDPATH='' cd -P -- "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 DOT_TEST_TMP=$(mktemp -d)
 DOT_TEST_TMP=$(cd -P -- "$DOT_TEST_TMP" && pwd -P)
 export DOT_TEST_ROOT DOT_TEST_TMP

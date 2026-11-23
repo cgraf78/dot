@@ -5,7 +5,7 @@ set -euo pipefail
 # Trust fixtures must be secure independent of the caller's ambient umask.
 umask 077
 
-root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+root=$(CDPATH='' cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=lib/test.sh
 . "$root/tests/lib/test.sh"
 

@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+root=$(CDPATH='' cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 manifest=$root/docs/source-provenance-v1.tsv
 revisions=$root/docs/source-revisions-v1.tsv
 documentation=$root/docs/source-provenance.md

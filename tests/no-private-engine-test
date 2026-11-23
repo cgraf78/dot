@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+root=$(CDPATH='' cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 if [[ -n $(find "$root/lib/dot" -mindepth 1 -maxdepth 1 \
   ! -name public -print -quit) ]]; then
