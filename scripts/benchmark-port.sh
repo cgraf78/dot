@@ -1012,6 +1012,37 @@ perf_prepare_provider_run_root() {
   }
 }
 
+# The frozen shell engine accepts only its own pinned installer digest. Its
+# fallback still activates the current library and binary via SHDEPS_LIB.
+# Stage the historical installer locally so the fallback never uses the network.
+perf_stage_provider_download() {
+  local repository=$1 revision=$2 expected_digest=$3 directory=$4 digest
+  local fixture=$directory/install.sh
+  local url=https://raw.githubusercontent.com/cgraf78/shdeps/$revision/install.sh
+
+  "$PERF_MKDIR" -p -- "$directory" || return 1
+  perf_git -C "$repository" cat-file blob "$revision:install.sh" >"$fixture" || return 1
+  digest=$("$PERF_SHA256SUM" <"$fixture") || return 1
+  [[ ${digest%% *} == "$expected_digest" ]] || {
+    printf 'error: historical Shdeps installer does not match the shell lock digest\n' >&2
+    return 1
+  }
+
+  {
+    printf '#!/bin/bash\nfixture=%q\nurl=%q\n' "$fixture" "$url"
+    cat <<'EOF'
+if [[ $# -eq 12 && $1 == --connect-timeout && $3 == --max-time \
+  && $5 == --speed-limit && $7 == --speed-time && $9 == -fsSL \
+  && ${10} == "$url" && ${11} == -o && -n ${12} ]]; then
+  exec cat -- "$fixture" >"${12}"
+fi
+printf 'error: unexpected curl request in performance fixture\n' >&2
+exit 1
+EOF
+  } >"$directory/curl" || return 1
+  "$PERF_CHMOD" 0700 "$directory/curl"
+}
+
 perf_require_dissociated_repository() {
   local root=$1 git_dir objects alternates
 
@@ -1047,7 +1078,7 @@ perf_require_all_source_identities() {
 }
 
 perf_lock_identity() {
-  local root=$1 key value extra revision='' abi=''
+  local root=$1 key value extra revision='' abi='' install_sha256=''
 
   while IFS='=' read -r key value extra; do
     case $key in
@@ -1055,15 +1086,21 @@ perf_lock_identity() {
         [[ -z $revision && -z ${extra:-} ]] || return 1
         revision=$value
         ;;
+      install_sha256)
+        [[ -z $install_sha256 && -z ${extra:-} ]] || return 1
+        install_sha256=$value
+        ;;
       abi)
         [[ -z $abi && -z ${extra:-} ]] || return 1
         abi=$value
         ;;
     esac
   done <"$root/support/shdeps.lock" || return 1
-  [[ $revision =~ ^[0-9a-f]{40}$ && $abi =~ ^[0-9]+$ ]] || return 1
+  [[ $revision =~ ^[0-9a-f]{40}$ && $abi =~ ^[0-9]+$ \
+    && $install_sha256 =~ ^[0-9a-f]{64}$ ]] || return 1
   REPLY_REVISION=$revision
   REPLY_ABI=$abi
+  REPLY_INSTALL_SHA256=$install_sha256
 }
 
 perf_write_final_driver() {
@@ -2211,12 +2248,12 @@ perf_main() {
 
   local script=${BASH_SOURCE[0]} script_dir root baseline_manifest
   local key value extra shell_commit='' shdeps_commit='' shell_shdeps_commit=''
-  local shdeps_abi='' current_commit='' current_dirty=false
+  local shdeps_abi='' shell_shdeps_digest current_commit='' current_dirty=false
   local run_id current_tree current_status_blob shell_tree shdeps_tree
   local artifact_config artifact_dir scratch staging completion_path candidate_root shell_root
   local publication
   local cargo_target_root shdeps_target dot_target command_supervisor
-  local shdeps_source shdeps_origin shdeps_parent shdeps_root shdeps_run_root
+  local shdeps_source shdeps_origin shdeps_parent shdeps_root shdeps_run_root provider_downloads
   local cargo_status
 
   case $script in
@@ -2332,6 +2369,7 @@ perf_main() {
     exit 1
   }
   shell_shdeps_commit=$REPLY_REVISION
+  shell_shdeps_digest=$REPLY_INSTALL_SHA256
   [[ $REPLY_ABI == "$shdeps_abi" ]] || {
     printf 'error: current and historical Shdeps ABIs are incompatible\n' >&2
     exit 1
@@ -2344,6 +2382,9 @@ perf_main() {
   "$PERF_MKDIR" -p -- "$shdeps_parent"
   perf_git clone --mirror --no-local --quiet "$shdeps_source" "$shdeps_origin"
   perf_require_dissociated_repository "$shdeps_origin" || exit 1
+  provider_downloads=$scratch/provider-downloads
+  perf_stage_provider_download "$shdeps_origin" "$shell_shdeps_commit" \
+    "$shell_shdeps_digest" "$provider_downloads" || exit 1
   perf_git -C "$shdeps_origin" cat-file -e "$shdeps_commit^{commit}"
   perf_git clone --no-local --quiet "$shdeps_origin" "$shdeps_root"
   perf_git -C "$shdeps_root" checkout --quiet --detach "$shdeps_commit"
@@ -2408,6 +2449,7 @@ perf_main() {
   perf_prepare_provider_run_root "$shdeps_root" "$shdeps_target/release/shdeps" \
     "$shdeps_run_root" "$shdeps_commit" || exit 1
   DOT_PERF_SHDEPS_ROOT=$shdeps_run_root
+  PERF_CLIENT_PATH=$provider_downloads:$PERF_CLIENT_PATH
   PERF_CARGO_TARGET_DIR=$dot_target
   perf_require_all_source_identities pre-measurement || exit 1
   perf_release_cargo_test_contract "$candidate_root" || exit 1
