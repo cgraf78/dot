@@ -2292,6 +2292,12 @@ perf_main() {
     printf 'error: scratch parent must be an absolute writable directory\n' >&2
     exit 1
   }
+  # The provider download fixture adds a scratch directory to the client PATH.
+  # A colon would split that entry and let the benchmark invoke system curl.
+  if [[ $PERF_SCRATCH_PARENT == *:* ]]; then
+    printf 'error: scratch parent cannot contain a colon (PATH separator)\n' >&2
+    exit 1
+  fi
   scratch=$("$PERF_MKTEMP" -d "$PERF_SCRATCH_PARENT/dot-performance.XXXXXX") || {
     printf 'error: cannot create performance scratch directory\n' >&2
     exit 1
