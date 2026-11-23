@@ -21,6 +21,41 @@ run_tests() {
     "$root/bin/dot" test "$@"
 }
 
+# Exercise the provider runner's real discovery before the native coordinator.
+# Candidate suite bodies are irrelevant here, so record the launcher names.
+provider_fixture=$DOT_TEST_TMP/provider-runner
+mkdir -p "$provider_fixture/tests" "$provider_fixture/bin"
+cp "$root/tests/run" "$root/tests/provider-suite-wrapper" "$provider_fixture/tests/"
+cat >"$provider_fixture/bin/dot" <<'EOF'
+#!/usr/bin/env bash
+[[ $1 == test ]] || exit 3
+: >"${DOT_PROVIDER_TEST_ROOT%/tests}/native-invoked"
+for launcher in "$DOT_TEST_TESTS_DIR"/*-test; do
+  printf '%s\n' "${launcher##*/}"
+done
+EOF
+chmod 0755 "$provider_fixture/bin/dot"
+touch "$provider_fixture/tests/alpha-test" "$provider_fixture/tests/beta-test" \
+  "$provider_fixture/tests/release-scripts-test"
+chmod 0755 "$provider_fixture/tests/alpha-test" "$provider_fixture/tests/beta-test"
+chmod 0644 "$provider_fixture/tests/release-scripts-test"
+run_provider() {
+  DOT_TEST_RESULT_FILE='' DOT_TEST_REPORTER='' bash "$provider_fixture/tests/run"
+}
+expected_launchers=$'alpha-test\nbeta-test'
+assert_eq "$expected_launchers" "$(run_provider)" 'provider runner wraps both native suites'
+
+chmod 0644 "$provider_fixture/tests/beta-test"
+rm "$provider_fixture/native-invoked"
+provider_status=0
+provider_output=$(run_provider 2>&1) || provider_status=$?
+assert_eq 1 "$provider_status" 'provider runner rejects a nonexecutable native suite'
+assert_contains 'beta-test' "$provider_output" 'provider runner names the nonexecutable suite'
+[[ ! -e $provider_fixture/native-invoked ]] || fail 'provider runner started the native coordinator'
+
+chmod 0755 "$provider_fixture/tests/beta-test" "$provider_fixture/tests/release-scripts-test"
+assert_eq "$expected_launchers" "$(run_provider)" 'separately run release suite stays excluded'
+
 timeout_command=$root/lib/dot/public/test-timeout-v1
 timeout_python=$(command -v python3)
 [[ ! -x /usr/bin/python3 ]] || timeout_python=/usr/bin/python3
