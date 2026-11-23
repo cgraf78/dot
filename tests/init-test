@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+root=$(CDPATH='' cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=lib/test.sh
 . "$root/tests/lib/test.sh"
 # shellcheck source=lib/repo.sh
@@ -313,12 +313,12 @@ assert_contains 'phase=backing-up' \
 
 set +e
 host_git_resume_output=$(
-PATH="$host_git_home/.local/bin:$host_git_regular_bin:$PATH" \
-  DOT_TEST_REAL_GIT=$system_git \
-  DOT_TEST_HOST_GIT=$host_git_regular_bin/git \
-  DOT_TEST_GIT_WRAPPER_MARKER=$host_git_marker \
-  run_dot "$host_git_home" "$host_git_state" init --yes \
-  "file://$host_git_origin" 2>&1
+  PATH="$host_git_home/.local/bin:$host_git_regular_bin:$PATH" \
+    DOT_TEST_REAL_GIT=$system_git \
+    DOT_TEST_HOST_GIT=$host_git_regular_bin/git \
+    DOT_TEST_GIT_WRAPPER_MARKER=$host_git_marker \
+    run_dot "$host_git_home" "$host_git_state" init --yes \
+    "file://$host_git_origin" 2>&1
 )
 host_git_status=$?
 set -e

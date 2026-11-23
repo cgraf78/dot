@@ -221,7 +221,7 @@ if [[ $rust_job == *'test-command:'* ]]; then
 fi
 assert_contains $'fmt-command: |\n        cargo fmt --check\n        rustfmt --edition 2024 --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs' \
   "$rust_job" 'Rust quality gate formats the supervisor sources outside Cargo targets'
-assert_contains 'test-command: bash tests/library-test' "$shell_job" \
+assert_contains 'test-command: CDPATH=. bash tests/library-test' "$shell_job" \
   'shell CI runs sourceable public-library acceptance without a Rust toolchain'
 if [[ $shell_job == *'tests/run'* || $shell_job == *'tests/release-scripts-test'* ]]; then
   fail 'shell CI must not run the Cargo-dependent release contract'

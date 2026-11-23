@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+root=$(CDPATH='' cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 provider_test_home=${HOME:?HOME must be set}
 outer_result_file=${DOT_TEST_RESULT_FILE:-}
 outer_reporter=${DOT_TEST_REPORTER:-}
