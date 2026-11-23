@@ -4847,6 +4847,50 @@ perf_prepare_provider_run_root "$provider_sealed" "$provider_bin/shdeps" \
 "$provider_run/target/release/shdeps" version | grep -q "$provider_short" ||
   fail 'staged binary does not match run-root HEAD'
 
+# The benchmark runs on Linux and uses sha256sum. The historical engine
+# checks its own digest even with the current provider library and binary.
+if [[ $(uname -s) == Linux ]]; then
+  printf '# historical installer\n' >"$provider_sealed/install.sh"
+  git -C "$provider_sealed" add install.sh
+  git -C "$provider_sealed" -c core.hooksPath=/dev/null -c user.name=t -c user.email=t@t \
+    -c commit.gpgsign=false commit -qm 'historical installer'
+  historical_commit=$(git -C "$provider_sealed" rev-parse HEAD)
+  PERF_SHA256SUM=$(command -v sha256sum)
+  historical_digest=$("$PERF_SHA256SUM" <"$provider_sealed/install.sh")
+  historical_digest=${historical_digest%% *}
+  printf '# current installer\n' >"$provider_sealed/install.sh"
+  git -C "$provider_sealed" add install.sh
+  git -C "$provider_sealed" -c core.hooksPath=/dev/null -c user.name=t -c user.email=t@t \
+    -c commit.gpgsign=false commit -qm 'current installer'
+
+  provider_downloads=$DOT_TEST_TMP/provider-downloads
+  PERF_ENV=$(command -v env)
+  PERF_DRIVER_HOME=$DOT_TEST_TMP
+  PERF_SCRATCH_PARENT=$DOT_TEST_TMP
+  PERF_CLIENT_PATH=$PATH
+  export PERF_ENV PERF_DRIVER_HOME PERF_SCRATCH_PARENT PERF_CLIENT_PATH
+  perf_stage_provider_download "$provider_sealed" "$historical_commit" \
+    "$historical_digest" "$provider_downloads" ||
+    fail 'benchmark could not stage the historical provider installer'
+  historical_url=https://raw.githubusercontent.com/cgraf78/shdeps/$historical_commit/install.sh
+  download_provider_fixture() {
+    "$provider_downloads/curl" --connect-timeout 10 --max-time 30 \
+      --speed-limit 1024 --speed-time 15 -fsSL "$1" -o "$2"
+  }
+  download_provider_fixture "$historical_url" "$DOT_TEST_TMP/provider-downloaded" ||
+    fail 'historical bootstrap could not retrieve its installer locally'
+  assert_eq '# historical installer' "$(<"$DOT_TEST_TMP/provider-downloaded")" \
+    'benchmark serves the historical installer bytes'
+  if download_provider_fixture https://example.invalid/install.sh "$DOT_TEST_TMP/unexpected" 2>/dev/null; then
+    fail 'benchmark accepted an unexpected download'
+  fi
+  [[ ! -e $DOT_TEST_TMP/unexpected ]] || fail 'unexpected download wrote an output file'
+  if perf_stage_provider_download "$provider_sealed" "$historical_commit" \
+    "$(printf '%064d' 0)" "$DOT_TEST_TMP/provider-mismatch" 2>/dev/null; then
+    fail 'benchmark accepted a provider installer with the wrong digest'
+  fi
+fi
+
 expired_fixtures=$(ls -A "$fixture_expired_dir")
 [[ -z $expired_fixtures ]] ||
   fail "self-bounded fixtures ran out instead of being stopped: $expired_fixtures"

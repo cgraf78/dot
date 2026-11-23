@@ -290,13 +290,14 @@ rather than network latency.
 ## Coverage boundary
 
 The required workflow runs the complete workload inventory on every candidate,
-as well as on its nightly schedule and through manual dispatch. The Shdeps
-source is checked out and built at the revision already pinned by Dot before
-measurement; all timed repository traffic uses local remotes. Network transfer,
-fixture construction, validation, and artifact calculation are never included
-in a sample. Offline runs may set `DOT_PERF_SHDEPS_SOURCE` to an existing local
-clone containing that pinned revision; the benchmark still creates and checks
-out its own isolated copy.
+as well as on its nightly schedule and through manual dispatch. Both engines
+use the Shdeps library and binary from the candidate's pin. If the shell
+baseline needs its own pinned installer, the benchmark supplies the exact bytes
+from local Git after checking the shell lock's digest. Timed repository traffic
+uses local remotes. Network transfer, fixture construction, validation, and
+artifact calculation are excluded from samples. Offline runs may set
+`DOT_PERF_SHDEPS_SOURCE` to a local clone containing both Shdeps lock revisions.
+The benchmark creates its own isolated copy.
 
 The gate makes no performance claim for dirty base-only updates, profile
 transitions, large real-world dependency manifests, remote-network latency, or
