@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@e9922d129ba6d9dc43793247409197b0b07b81c8
     with:
       # Full matrix on every PR: scheduled-only legs let main break
       # silently between daily runs and cannot validate their fixes.
@@ -98,7 +98,7 @@ jobs:
         tar -C .termux-ci -xzf "$archive"
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@e9922d129ba6d9dc43793247409197b0b07b81c8
     with:
       matrix-set: full
       profiles: base,python
@@ -152,7 +152,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: cgraf78/actions/.github/actions/rust-toolchain@e9922d129ba6d9dc43793247409197b0b07b81c8
 
       - name: Verify performance source provenance
         run: bash tests/provenance-test
@@ -222,4 +222,4 @@ jobs:
           GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@e9922d129ba6d9dc43793247409197b0b07b81c8
